@@ -1,0 +1,278 @@
+// iProofNow Prisma schema — Phase 0
+// Source of truth: Full_Backend_Developer_Brief §16.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────
+
+enum Role {
+  INDIVIDUAL
+  COMPANY
+  LAWYER
+  LAW_ENFORCEMENT
+  GOVERNMENT
+  ADMIN
+}
+
+enum ProofStatus {
+  DRAFT
+  SEALED
+}
+
+enum Visibility {
+  PRIVATE
+  PUBLIC
+  ORG
+}
+
+enum PackageStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+enum SubscriptionTier {
+  FREE
+  PRO
+  BUSINESS
+  ENTERPRISE
+}
+
+// ─── Models ───────────────────────────────────────────────────────────────
+
+model User {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  name             String
+  passwordHash     String
+  role             Role
+  orgId            String?
+  status           String           @default("active")
+  subscriptionTier SubscriptionTier @default(FREE)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  lastLoginAt      DateTime?
+
+  org              Organization?     @relation("OrgMembers", fields: [orgId], references: [id])
+  ownedOrgs        Organization[]    @relation("OrgOwner")
+  sessions         Session[]
+  proofsOwned      Proof[]
+  notifications    Notification[]
+  auditLogs        AuditLog[]
+  casesOwned       Case[]
+  evidencePackages EvidencePackage[]
+
+  @@index([email])
+  @@index([role])
+  @@index([orgId])
+}
+
+model Organization {
+  id          String   @id @default(cuid())
+  name        String
+  type        String
+  ownerUserId String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner   User    @relation("OrgOwner", fields: [ownerUserId], references: [id])
+  members User[]  @relation("OrgMembers")
+  proofs  Proof[]
+  cases   Case[]
+
+  @@index([ownerUserId])
+}
+
+// Session.id is the SHA-256(token) hex digest, per lucia-auth.com/sessions/basic.
+// The plaintext token is never persisted; it lives only in the user's cookie.
+model Session {
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Proof {
+  id             String      @id @default(cuid())
+  ownerUserId    String
+  orgId          String?
+  title          String
+  description    String      @default("")
+  categoryKey    String
+  proofType      String
+  status         ProofStatus @default(DRAFT)
+  visibility     Visibility  @default(PRIVATE)
+  eventDate      DateTime?
+  peopleInvolved String[]    @default([])
+  notes          String?
+  locationMode   String?
+  manualLocation String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  sealedAt       DateTime?
+
+  owner            User                 @relation(fields: [ownerUserId], references: [id])
+  org              Organization?        @relation(fields: [orgId], references: [id])
+  files            ProofFile[]
+  attestation      ProofAttestation?
+  verifications    VerificationRecord[]
+  caseLinks        CaseProof[]
+  preservation     PreservationConfig?
+  evidencePackages EvidencePackage[]
+
+  @@index([ownerUserId])
+  @@index([orgId])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+  @@index([ownerUserId, status])
+  @@index([orgId, status])
+}
+
+model ProofFile {
+  id           String   @id @default(cuid())
+  proofId      String
+  originalName String
+  mimeType     String
+  size         Int
+  storagePath  String
+  fileHash     String?
+  createdAt    DateTime @default(now())
+
+  proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
+
+  @@index([proofId])
+}
+
+model ProofAttestation {
+  id                  String   @id @default(cuid())
+  proofId             String   @unique
+  attestationName     String
+  attestationLocation String
+  attestationText     String
+  attestationFileId   String?
+  createdAt           DateTime @default(now())
+
+  proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
+}
+
+model VerificationRecord {
+  id               String   @id @default(cuid())
+  proofId          String
+  method           String
+  result           String
+  requesterContext Json     @default("{}")
+  createdAt        DateTime @default(now())
+
+  proof Proof @relation(fields: [proofId], references: [id])
+
+  @@index([proofId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  type      String
+  title     String
+  body      String
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model Case {
+  id          String   @id @default(cuid())
+  ownerUserId String
+  orgId       String?
+  title       String
+  description String   @default("")
+  status      String   @default("active")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner            User              @relation(fields: [ownerUserId], references: [id])
+  org              Organization?     @relation(fields: [orgId], references: [id])
+  proofLinks       CaseProof[]
+  evidencePackages EvidencePackage[]
+
+  @@index([ownerUserId])
+  @@index([orgId])
+  @@index([status])
+}
+
+model CaseProof {
+  id        String   @id @default(cuid())
+  caseId    String
+  proofId   String
+  createdAt DateTime @default(now())
+
+  case  Case  @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
+
+  @@unique([caseId, proofId])
+  @@index([caseId])
+  @@index([proofId])
+}
+
+model EvidencePackage {
+  id              String        @id @default(cuid())
+  caseId          String?
+  proofId         String?
+  status          PackageStatus @default(PENDING)
+  packageType     String
+  createdByUserId String
+  storagePath     String?
+  createdAt       DateTime      @default(now())
+
+  case      Case?  @relation(fields: [caseId], references: [id])
+  proof     Proof? @relation(fields: [proofId], references: [id])
+  createdBy User   @relation(fields: [createdByUserId], references: [id])
+
+  @@index([caseId])
+  @@index([proofId])
+  @@index([createdByUserId])
+  @@index([status])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String?
+  entityType  String
+  entityId    String
+  action      String
+  meta        Json     @default("{}")
+  createdAt   DateTime @default(now())
+
+  actor User? @relation(fields: [actorUserId], references: [id])
+
+  @@index([entityType, entityId, createdAt(sort: Desc)])
+  @@index([actorUserId, createdAt(sort: Desc)])
+}
+
+model PreservationConfig {
+  id               String   @id @default(cuid())
+  proofId          String   @unique
+  preservationMode Boolean  @default(false)
+  hiddenVaultMode  Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
+}
