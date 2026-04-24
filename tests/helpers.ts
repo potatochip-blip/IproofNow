@@ -1,4 +1,4 @@
-import { PrismaClient, type Role, type User } from '@prisma/client';
+import { PrismaClient, type Organization, type Proof, type Role, type User } from '@prisma/client';
 import { hashPassword } from '@/lib/password';
 import { createSession, generateSessionToken } from '@/lib/session';
 import { seedCookie } from './cookie-jar';
@@ -61,5 +61,58 @@ export function buildJsonRequest(
     method,
     headers: { 'Content-Type': 'application/json' },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+}
+
+/** Build a multipart/form-data request carrying a single "file" field. */
+export function buildMultipartRequest(
+  url: string,
+  fileBytes: Uint8Array,
+  filename: string,
+  mimeType: string
+): Request {
+  const form = new FormData();
+  const blob = new Blob([fileBytes], { type: mimeType });
+  form.append('file', blob, filename);
+  return new Request(url, { method: 'POST', body: form });
+}
+
+/** Create an Organization with an owner. */
+export async function createTestOrg(
+  ownerUserId: string,
+  name = 'Test Org'
+): Promise<Organization> {
+  return db().organization.create({
+    data: { name, type: 'company', ownerUserId },
+  });
+}
+
+/** Attach an existing user to an org. */
+export async function joinOrg(userId: string, orgId: string): Promise<void> {
+  await db().user.update({ where: { id: userId }, data: { orgId } });
+}
+
+/** Create a draft proof for a user. */
+export async function createTestProof(
+  ownerUserId: string,
+  overrides: Partial<{
+    title: string;
+    description: string;
+    categoryKey: string;
+    proofType: string;
+    orgId: string | null;
+    visibility: 'PRIVATE' | 'PUBLIC' | 'ORG';
+  }> = {}
+): Promise<Proof> {
+  return db().proof.create({
+    data: {
+      ownerUserId,
+      title: overrides.title ?? 'Test Proof',
+      description: overrides.description ?? '',
+      categoryKey: overrides.categoryKey ?? 'general',
+      proofType: overrides.proofType ?? 'document',
+      orgId: overrides.orgId ?? null,
+      ...(overrides.visibility ? { visibility: overrides.visibility } : {}),
+    },
   });
 }

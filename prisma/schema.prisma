@@ -45,6 +45,12 @@ enum SubscriptionTier {
   ENTERPRISE
 }
 
+enum HashStatus {
+  PENDING
+  COMPLETE
+  FAILED
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────
 
 model User {
@@ -119,6 +125,7 @@ model Proof {
   notes          String?
   locationMode   String?
   manualLocation String?
+  roleContext    String?
   createdAt      DateTime    @default(now())
   updatedAt      DateTime    @updatedAt
   sealedAt       DateTime?
@@ -141,14 +148,15 @@ model Proof {
 }
 
 model ProofFile {
-  id           String   @id @default(cuid())
+  id           String     @id @default(cuid())
   proofId      String
   originalName String
   mimeType     String
   size         Int
   storagePath  String
   fileHash     String?
-  createdAt    DateTime @default(now())
+  hashStatus   HashStatus @default(PENDING)
+  createdAt    DateTime   @default(now())
 
   proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
 
