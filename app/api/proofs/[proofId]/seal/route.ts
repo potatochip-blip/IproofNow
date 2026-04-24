@@ -3,6 +3,7 @@ import { prisma } from '@/lib/db';
 import { requireSession } from '@/lib/guards';
 import { ApiError, errorResponse } from '@/lib/errors';
 import { writeAudit } from '@/lib/audit';
+import { createNotification } from '@/lib/notifications';
 import { loadProofForWrite } from '@/lib/proof-guards';
 
 type RouteCtx = { params: { proofId: string } };
@@ -50,6 +51,14 @@ export async function POST(_req: NextRequest, ctx: RouteCtx) {
       entityId: sealed.id,
       action: 'proof.sealed',
       meta: { sealedAt: sealedAt.toISOString() },
+    });
+
+    await createNotification({
+      userId: sealed.ownerUserId,
+      type: 'proof_sealed',
+      title: 'Proof sealed',
+      body: `"${sealed.title}" has been sealed.`,
+      href: `/proofs/${sealed.id}`,
     });
 
     return NextResponse.json({
