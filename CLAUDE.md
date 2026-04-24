@@ -45,26 +45,34 @@ app/
   api/
     auth/{login,logout,me,session}/route.ts
     dashboard/route.ts
+    proofs/route.ts                             # create + list
+    proofs/[proofId]/route.ts                   # detail + update
+    proofs/[proofId]/files/route.ts             # upload + list
+    proofs/[proofId]/attestation/route.ts       # upsert
+    proofs/[proofId]/seal/route.ts              # finalize
 lib/
   db.ts                      # Prisma client singleton
   session.ts                 # generateSessionToken, createSession, validate (sliding refresh), invalidate*
   cookies.ts                 # session cookie set/clear/read
   password.ts                # argon2id hash/verify
   serializers.ts             # Role/Tier enum ↔ frontend casing, serializeUser()
+  proof-serializers.ts       # Proof/File/Attestation ↔ frontend (async — signs download URLs)
+  proof-guards.ts            # loadProofForRead/Write + assertNotSealed (hidden-vault 404)
+  storage.ts                 # S3Client singleton + putObject + presigned GET (MinIO via forcePathStyle)
   guards.ts                  # getCurrentSession, requireSession, requireRole(...roles)
   errors.ts                  # ApiError + typed subclasses + errorResponse()
   audit.ts                   # writeAudit() — fire-and-log, never throws
   logger.ts                  # JSON line logger
 middleware.ts                # CORS for /api/* (allowlist + credentials)
 prisma/
-  schema.prisma              # 13 entities + 5 enums
+  schema.prisma              # 13 entities + 6 enums
   seed.ts                    # 6 users (one per role); refuses to run in production
 tests/
   global-setup.ts            # prisma db push --force-reset against *_test DB
   test-env.ts                # mocks next/headers cookies(); pins NODE_ENV=test
   cookie-jar.ts              # in-memory jar that quacks like cookies()
-  helpers.ts                 # truncateAll, createTestUser, loginAs, buildJsonRequest
-  auth.test.ts dashboard.test.ts
+  helpers.ts                 # truncateAll, createTestUser, loginAs, createTestOrg, createTestProof, buildJsonRequest, buildMultipartRequest
+  auth.test.ts dashboard.test.ts proofs.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
@@ -80,7 +88,12 @@ docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket cr
 Enums: `Role` (INDIVIDUAL|COMPANY|LAWYER|LAW_ENFORCEMENT|GOVERNMENT|ADMIN),
 `ProofStatus` (DRAFT|SEALED), `Visibility` (PRIVATE|PUBLIC|ORG),
 `PackageStatus` (PENDING|READY|FAILED), `SubscriptionTier`
-(FREE|PRO|BUSINESS|ENTERPRISE).
+(FREE|PRO|BUSINESS|ENTERPRISE), `HashStatus` (PENDING|COMPLETE|FAILED).
+
+**Phase 2 schema additions**: `Proof.roleContext String?` (freeform role
+context on draft creation); `ProofFile.hashStatus HashStatus @default(PENDING)`
+(lets the frontend distinguish "not computed yet" from "failed" from
+"legacy"; Phase 6 worker flips to COMPLETE when `fileHash` is populated).
 
 Every FK is indexed. Common query columns indexed: `Proof.ownerUserId`,
 `Proof.orgId`, `(Proof.ownerUserId,status)`, `(Proof.orgId,status)`,
@@ -173,6 +186,55 @@ provisional and revisit then.
 
 ---
 
+## API contracts (Phase 2 — Proofs + Files + Attestation + Seal)
+
+### Endpoints
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `POST`  | `/api/proofs` | required | body `{proofType, categoryKey, title, description?, roleContext?}`. 201 → `{ proof }`. Inherits `orgId` from user. Audits `proof.created`. |
+| `GET`   | `/api/proofs` | required | `?status=&category=&scope=&page=&pageSize=`. Default scope = own + same-org non-private, hidden excluded. `?scope=hidden` → caller's hidden-vault proofs only; audits `proof.hidden.listed`. 200 → `{ proofs: ProofSummary[], pagination }`. |
+| `GET`   | `/api/proofs/:proofId` | required | Full detail. Owner OR (same-org AND visibility≠PRIVATE) OR PUBLIC. **Hidden vault: returns 404 to non-owner — does not leak existence.** 200 → `{ proof }`. |
+| `PATCH` | `/api/proofs/:proofId` | required | Owner-only (403 otherwise). 409 if SEALED. Preservation/hidden flags upsert `PreservationConfig`. Audits `proof.updated`. 200 → `{ proof }`. |
+| `POST`  | `/api/proofs/:proofId/files` | required | `multipart/form-data` field `file`. Max 100 MB. Mime allowlist: `image/*`, `video/*`, `audio/*`, `application/pdf`, `text/plain`, `application/msword`, `application/vnd.openxmlformats-officedocument.*`. Owner-only. 409 if SEALED. 201 → `{ file }` (full serialized file with presigned `downloadUrl`). Audits `proof.file.uploaded`. |
+| `GET`   | `/api/proofs/:proofId/files` | required | Read access. 200 → `{ files: [{ ...meta, downloadUrl }] }` — `downloadUrl` is a fresh presigned GET (15 min TTL). |
+| `POST`  | `/api/proofs/:proofId/attestation` | required | Upsert (unique per proof). Owner-only. 409 if SEALED. `attestationFileId` (if provided) must belong to this proof. 200 → `{ attestation }`. Audits `proof.attestation.saved`. |
+| `POST`  | `/api/proofs/:proofId/seal` | required | Owner-only. Transitions DRAFT→SEALED; stamps `sealedAt`. 200 → `{ proofId, status:'sealed', sealedAt }`. Audits `proof.sealed`. |
+
+### Seal failure shape
+
+Seal accumulates ALL blockers so the frontend can surface them together
+(no whack-a-mole validation). The reason set is **closed** — adding a
+new reason is a deliberate contract change, never a freeform string.
+
+```json
+{
+  "error": {
+    "code": "SEAL_REQUIREMENTS_NOT_MET",
+    "message": "Proof cannot be sealed",
+    "details": { "reasons": ["missing_title", "missing_file", "missing_attestation"] }
+  }
+}
+```
+
+`SealBlockReason = 'missing_title' | 'missing_file' | 'missing_attestation' | 'already_sealed'`
+
+### File URL namespacing
+
+The file serializer returns `downloadUrl`, not `url`. When thumbnails /
+transcoded variants arrive later they get their own fields (`thumbnailUrl`,
+`previewUrl`) — renaming `url` later would break clients.
+
+### Hidden-vault invariant (critical)
+
+A proof with `PreservationConfig.hiddenVaultMode = true` is **404 to
+everyone except the owner** — including org-mates who would normally see
+it under default visibility rules. Do not change this to 403; the whole
+point is that the proof's existence is not revealed. Tested in
+`tests/proofs.test.ts`.
+
+---
+
 ## Cookies & CORS
 
 Cookie attributes (`lib/cookies.ts`):
@@ -218,13 +280,26 @@ no `Cookie:` header going out", it's almost always one of:
 
 ## Audit rules
 
-**Phase 1 audited actions** (only):
+**Phase 1 audited actions**:
 
 - `auth.login.success`
 - `auth.login.failure`
 - `auth.logout`
 - `auth.session.expired` (reserved — emit when session validation deletes an
   expired row)
+
+**Phase 2 audited actions**:
+
+- `proof.created` — state change on POST /api/proofs
+- `proof.updated` — state change on PATCH; `meta.fields` lists touched keys
+- `proof.file.uploaded` — state change; `meta` carries fileId, mimeType, size, originalName
+- `proof.attestation.saved` — state change (covers both create + update since attestation is upsert)
+- `proof.sealed` — state change on POST /seal; `meta.sealedAt`
+- `proof.hidden.listed` — **sensitive read** — emitted when the owner pulls `?scope=hidden`
+
+Explicitly **not** audited in Phase 2: GET list (default scope), GET detail
+on own proof, GET detail on org-visible proof, GET /files list (same access
+check as detail). Phase 3 will add hidden-vault reveal audit.
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -310,8 +385,15 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
 - [x] **Phase 1 — Auth + Dashboard**: `/api/auth/{login,logout,me,session}`,
       `/api/dashboard`, vitest integration tests, `prisma/seed.ts` (6
       users).
-- [ ] Phase 2 — Proofs (create/update/detail, file upload to MinIO,
-      attestation, seal).
-- [ ] Phase 3 — Vault, verification, notifications, audit query.
+- [x] **Phase 2 — Proofs + Files + Attestation + Seal**: `/api/proofs` CRUD,
+      `/api/proofs/[id]/files` multipart upload to MinIO + presigned
+      `downloadUrl`, `/api/proofs/[id]/attestation` upsert,
+      `/api/proofs/[id]/seal` with accumulated `details.reasons[]`.
+      `Proof.roleContext` + `ProofFile.hashStatus` schema additions.
+      `lib/{storage,proof-serializers,proof-guards}`. Hidden-vault
+      404-on-non-owner invariant enforced. `proof.hidden.listed` audits
+      sensitive reads.
+- [ ] Phase 3 — Vault, verification, notifications, audit query, hidden-vault
+      reveal endpoint (+ audit).
 - [ ] Phase 4 — Cases, evidence packages, exports.
 - [ ] Phase 5+ — Background jobs, OpenTimestamps batching, hardening.
