@@ -1,4 +1,4 @@
-import { PrismaClient, type Organization, type Proof, type Role, type User } from '@prisma/client';
+import { PrismaClient, type Notification, type Organization, type Proof, type Role, type User, type VerificationRecord } from '@prisma/client';
 import { hashPassword } from '@/lib/password';
 import { createSession, generateSessionToken } from '@/lib/session';
 import { seedCookie } from './cookie-jar';
@@ -102,6 +102,7 @@ export async function createTestProof(
     proofType: string;
     orgId: string | null;
     visibility: 'PRIVATE' | 'PUBLIC' | 'ORG';
+    peopleInvolved: string[];
   }> = {}
 ): Promise<Proof> {
   return db().proof.create({
@@ -113,6 +114,42 @@ export async function createTestProof(
       proofType: overrides.proofType ?? 'document',
       orgId: overrides.orgId ?? null,
       ...(overrides.visibility ? { visibility: overrides.visibility } : {}),
+      ...(overrides.peopleInvolved ? { peopleInvolved: overrides.peopleInvolved } : {}),
+    },
+  });
+}
+
+export async function createTestNotification(
+  userId: string,
+  overrides: Partial<{
+    type: string;
+    title: string;
+    body: string;
+    href: string | null;
+    readAt: Date | null;
+  }> = {}
+): Promise<Notification> {
+  return db().notification.create({
+    data: {
+      userId,
+      type: overrides.type ?? 'proof_sealed',
+      title: overrides.title ?? 'Test',
+      body: overrides.body ?? 'Test body',
+      href: overrides.href ?? null,
+      readAt: overrides.readAt ?? null,
+    },
+  });
+}
+
+export async function createTestVerification(
+  proofId: string,
+  overrides: Partial<{ method: string; result: string }> = {}
+): Promise<VerificationRecord> {
+  return db().verificationRecord.create({
+    data: {
+      proofId,
+      method: overrides.method ?? 'hash',
+      result: overrides.result ?? 'verified',
     },
   });
 }
