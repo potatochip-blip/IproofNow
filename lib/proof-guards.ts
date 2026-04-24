@@ -1,6 +1,6 @@
 import type { User, Proof, ProofFile, ProofAttestation, PreservationConfig } from '@prisma/client';
 import { prisma } from './db';
-import { ConflictError, ForbiddenError, NotFoundError } from './errors';
+import { ConflictError, ForbiddenError, NotFoundError, UnauthorizedError } from './errors';
 
 export type ProofWithRelations = Proof & {
   files: ProofFile[];
@@ -8,7 +8,7 @@ export type ProofWithRelations = Proof & {
   preservation: PreservationConfig | null;
 };
 
-type Actor = Pick<User, 'id' | 'orgId'>;
+export type Actor = Pick<User, 'id' | 'orgId'>;
 
 function isOwner(proof: Pick<Proof, 'ownerUserId'>, actor: Actor): boolean {
   return proof.ownerUserId === actor.id;
@@ -86,4 +86,44 @@ export function assertNotSealed(proof: Pick<Proof, 'status'>): void {
   if (proof.status === 'SEALED') {
     throw new ConflictError('Proof is sealed and cannot be modified');
   }
+}
+
+/**
+ * Load a proof for the verify / verification-history endpoints. Differs from
+ * loadProofForRead in that PUBLIC proofs are reachable without a session.
+ *
+ * Access ladder (first match wins):
+ *   - missing                    → 404
+ *   - hiddenVaultMode && !owner  → 404 (invariant: no existence leak)
+ *   - visibility === PUBLIC      → allow (no session required)
+ *   - no actor                   → 401
+ *   - owner                      → allow
+ *   - same-org && !PRIVATE       → allow
+ *   - otherwise                  → 404 (don't leak that it exists)
+ */
+export async function loadProofForVerify(
+  proofId: string,
+  actor: Actor | null
+): Promise<ProofWithRelations> {
+  const proof = await prisma.proof.findUnique({
+    where: { id: proofId },
+    include: { files: true, attestation: true, preservation: true },
+  });
+  if (!proof) throw new NotFoundError('Proof not found');
+
+  const owner = actor ? isOwner(proof, actor) : false;
+  const hidden = proof.preservation?.hiddenVaultMode ?? false;
+
+  if (hidden && !owner) throw new NotFoundError('Proof not found');
+
+  if (proof.visibility === 'PUBLIC') return proof;
+
+  if (!actor) throw new UnauthorizedError();
+
+  if (owner) return proof;
+
+  const orgReadable = isSameOrg(proof, actor) && proof.visibility !== 'PRIVATE';
+  if (!orgReadable) throw new NotFoundError('Proof not found');
+
+  return proof;
 }
