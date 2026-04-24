@@ -50,6 +50,14 @@ app/
     proofs/[proofId]/files/route.ts             # upload + list
     proofs/[proofId]/attestation/route.ts       # upsert
     proofs/[proofId]/seal/route.ts              # finalize
+    proofs/[proofId]/verify/route.ts            # record verification attempt
+    proofs/[proofId]/verifications/route.ts     # history + counts
+    vault/route.ts                              # owner-scoped list w/ q, filters, hasFiles/hasAttestation
+    vault/[proofId]/reveal/route.ts             # audited hidden-vault reveal
+    notifications/route.ts                      # list + unreadCount
+    notifications/[notificationId]/route.ts     # PATCH read/unread
+    notifications/read-all/route.ts             # mark-all
+    audit/route.ts                              # actor-scoped audit query (admin sees all)
 lib/
   db.ts                      # Prisma client singleton
   session.ts                 # generateSessionToken, createSession, validate (sliding refresh), invalidate*
@@ -57,7 +65,9 @@ lib/
   password.ts                # argon2id hash/verify
   serializers.ts             # Role/Tier enum ↔ frontend casing, serializeUser()
   proof-serializers.ts       # Proof/File/Attestation ↔ frontend (async — signs download URLs)
-  proof-guards.ts            # loadProofForRead/Write + assertNotSealed (hidden-vault 404)
+  proof-guards.ts            # loadProofForRead/Write/Verify + assertNotSealed (hidden-vault 404)
+  proof-search.ts            # q+filter Prisma where composer (route-agnostic; reusable Phase 4)
+  notifications.ts           # createNotification + NotificationType closed union
   storage.ts                 # S3Client singleton + putObject + presigned GET (MinIO via forcePathStyle)
   guards.ts                  # getCurrentSession, requireSession, requireRole(...roles)
   errors.ts                  # ApiError + typed subclasses + errorResponse()
@@ -72,7 +82,7 @@ tests/
   test-env.ts                # mocks next/headers cookies(); pins NODE_ENV=test
   cookie-jar.ts              # in-memory jar that quacks like cookies()
   helpers.ts                 # truncateAll, createTestUser, loginAs, createTestOrg, createTestProof, buildJsonRequest, buildMultipartRequest
-  auth.test.ts dashboard.test.ts proofs.test.ts
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
@@ -231,7 +241,70 @@ A proof with `PreservationConfig.hiddenVaultMode = true` is **404 to
 everyone except the owner** — including org-mates who would normally see
 it under default visibility rules. Do not change this to 403; the whole
 point is that the proof's existence is not revealed. Tested in
-`tests/proofs.test.ts`.
+`tests/proofs.test.ts` and `tests/vault-reveal.test.ts` /
+`tests/verify.test.ts`.
+
+---
+
+## API contracts (Phase 3 — Vault + Verify + Notifications + Audit)
+
+### Endpoints
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `GET`   | `/api/vault` | required | Owner-scoped only (no org). `?q=&proofType=&category=&status=&visibility=&scope=hidden&sortBy=(createdAt\|sealedAt\|title)&sortDir=(asc\|desc)&page=&pageSize=`. Rows carry `hasFiles`/`hasAttestation` booleans. `?scope=hidden` audits `proof.hidden.listed`. |
+| `POST`  | `/api/vault/:proofId/reveal` | required | Owner-only. 403 if visible-but-not-owner, 404 if missing or hidden-not-owner. Body `{ reason: 'case_review'\|'export_prep'\|'user_browse'\|'other', reasonText? }` — `reasonText` required when `reason === 'other'` (400 otherwise). 200 → `{ proof }` (same as GET /api/proofs/:id). Audits `proof.hidden.revealed` with reason. Does **not** flip `hiddenVaultMode`. |
+| `POST`  | `/api/proofs/:proofId/verify` | conditional | PUBLIC proofs verifiable without auth. PRIVATE/ORG require session + read access. Hidden → 404. Body `{ method: 'hash'\|'qr'\|'link', context? }`. 200 → `{ verificationId, proofId, result, verifiedAt }`. Phase 3 `result` is always `'verified'`. Audits `proof.verified`. |
+| `GET`   | `/api/proofs/:proofId/verifications` | conditional | Same access rules as `/verify`. Paginated history + `counts: { verified, notFound, tampered }`. No audit (metadata read). |
+| `GET`   | `/api/notifications` | required | `?unreadOnly=&page=&pageSize=`. Session-user scope. 200 → `{ notifications, unreadCount, pagination }`. No audit. |
+| `PATCH` | `/api/notifications/:notificationId` | required | `{ read: boolean }`. Missing → 404, foreign → 403 (intentional asymmetry with vault's 404-mask; notifications aren't sensitive content). No audit. |
+| `POST`  | `/api/notifications/read-all` | required | 200 → `{ ok, updated }`. No audit. |
+| `GET`   | `/api/audit` | required | `?action=&entityType=&entityId=&since=&until=&page=&pageSize=`. Non-admin → `actorUserId === session.user`; ADMIN → all rows. Audits `audit.queried`; `meta.filterKeys` records which keys were applied (keys only, not values). |
+
+### Vault scope — why owner-only, not org
+
+`/api/proofs` already handles "own + same-org non-private" discovery. The
+vault surface is deliberately narrower: it is the owner's private staging
+and archive UI, not a collaborative browser. Keeping cross-org listing on
+`/api/proofs` and owner-only on `/api/vault` is what lets the frontend
+render them as separate tabs without ambiguous scoping.
+
+### Proof-search `q` semantics
+
+`q` is ILIKE against `title` and `description`, plus exact-match on
+`peopleInvolved` array entries. Phase 5+ will swap this for a Postgres
+tsvector column so partial matches on tag entries work.
+
+### Vault row shape (`hasFiles` / `hasAttestation`)
+
+Vault rows extend the `ProofSummary` shape with two booleans so the list
+UI can render completion badges without fetching detail per row. Computed
+via a cheap projection — `files: { select:{id:true}, take:1 }` and
+`attestation: { select:{id:true} }` — no full load.
+
+### Reveal response vs `hiddenVaultMode`
+
+The reveal endpoint returns the **full proof detail** but leaves
+`hiddenVaultMode` untouched. That's the point: reveals are one-shot,
+audited retrievals — the proof stays hidden afterward. If an owner wants
+to un-hide permanently, that's a `PATCH /api/proofs/:id` with
+`hiddenVaultMode: false`, audited as `proof.updated`.
+
+---
+
+## Notification types
+
+Closed enum — frontend branches on `type` to pick icons and route targets,
+so freeform strings would silently break UX. Adding a type is a contract
+change.
+
+- `proof_sealed` — emitted on `POST /api/proofs/:id/seal`. Recipient =
+  owner. `href = /proofs/:id`. Self-notify is intentionally in today; when
+  the frontend wires up richer recipients (org-mates on ORG proofs, case
+  collaborators) the recipient set expands here.
+
+Additions must update this list **and** the `NotificationType` union in
+`lib/notifications.ts`. Like audit actions, these are a versioned contract.
 
 ---
 
@@ -295,11 +368,22 @@ no `Cookie:` header going out", it's almost always one of:
 - `proof.file.uploaded` — state change; `meta` carries fileId, mimeType, size, originalName
 - `proof.attestation.saved` — state change (covers both create + update since attestation is upsert)
 - `proof.sealed` — state change on POST /seal; `meta.sealedAt`
-- `proof.hidden.listed` — **sensitive read** — emitted when the owner pulls `?scope=hidden`
+- `proof.hidden.listed` — **sensitive read** — emitted when the owner pulls `?scope=hidden` on `/api/proofs` or `/api/vault` (vault sets `meta.via = 'vault'`)
 
 Explicitly **not** audited in Phase 2: GET list (default scope), GET detail
 on own proof, GET detail on org-visible proof, GET /files list (same access
-check as detail). Phase 3 will add hidden-vault reveal audit.
+check as detail).
+
+**Phase 3 audited actions**:
+
+- `proof.hidden.revealed` — **sensitive read** — POST /api/vault/:id/reveal; `meta.reason` (closed enum) + optional `meta.reasonText` (when reason='other') + `meta.hiddenVaultMode` (whether the proof is actually hidden — reveal works on non-hidden proofs too, for consistency)
+- `proof.verified` — **sensitive read when proof non-public** — POST /api/proofs/:id/verify; `meta.method`, `meta.result`, `meta.visibility`, `meta.anonymous` (true when no session)
+- `audit.queried` — **sensitive read** — GET /api/audit itself; `meta.filterKeys[]` (keys applied, not values), `meta.scope` ('self'|'all')
+
+Explicitly **not** audited in Phase 3: GET /api/vault (default scope),
+GET /api/notifications, notification PATCH, notification read-all,
+GET /api/proofs/:id/verifications (metadata read — the underlying
+proof's access check already gates it).
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -393,7 +477,16 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       `lib/{storage,proof-serializers,proof-guards}`. Hidden-vault
       404-on-non-owner invariant enforced. `proof.hidden.listed` audits
       sensitive reads.
-- [ ] Phase 3 — Vault, verification, notifications, audit query, hidden-vault
-      reveal endpoint (+ audit).
+- [x] **Phase 3 — Vault + Verify + Notifications + Audit**: `/api/vault`
+      (owner-scoped with `q`, filters, sort, `hasFiles`/`hasAttestation`),
+      `/api/vault/[id]/reveal` (audited hidden-vault reveal with closed
+      reason set), `/api/proofs/[id]/verify` (public for PUBLIC proofs,
+      Phase 3 always 'verified'), `/api/proofs/[id]/verifications`
+      (history + counts), `/api/notifications` (list + mark-read +
+      read-all), `/api/audit` (actor-scoped; ADMIN sees all).
+      `lib/proof-search.ts` + `lib/notifications.ts` + `loadProofForVerify`.
+      New audit actions: `proof.hidden.revealed`, `proof.verified`,
+      `audit.queried`. `NotificationType = 'proof_sealed'` (closed enum).
+      Seal now emits a `proof_sealed` notification to the owner.
 - [ ] Phase 4 — Cases, evidence packages, exports.
 - [ ] Phase 5+ — Background jobs, OpenTimestamps batching, hardening.
