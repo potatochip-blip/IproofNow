@@ -2,9 +2,11 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { NextRequest } from 'next/server';
 import { GET as vaultList } from '@/app/api/vault/route';
 import {
+  createTestOrg,
   createTestProof,
   createTestUser,
   db,
+  joinOrg,
   loginAs,
   truncateAll,
 } from './helpers';
@@ -19,8 +21,8 @@ afterAll(async () => {
   await db().$disconnect();
 });
 
-async function asUser() {
-  const { user } = await createTestUser();
+async function asUser(opts: { role?: 'INDIVIDUAL' | 'COMPANY' } = {}) {
+  const { user } = await createTestUser({ role: opts.role ?? 'INDIVIDUAL' });
   await loginAs(user.id);
   return user;
 }
@@ -31,12 +33,20 @@ function vaultReq(qs = '') {
 
 describe('GET /api/vault', () => {
   it('owner-scoped: excludes org-mate proofs even when org-visible', async () => {
-    const user = await asUser();
-    await createTestProof(user.id, { title: 'mine' });
+    const user = await asUser({ role: 'COMPANY' });
+    const org = await createTestOrg(user.id);
+    await joinOrg(user.id, org.id);
+    await createTestProof(user.id, { title: 'mine', orgId: org.id });
 
-    // Another user's proof shouldn't appear — even if visibility === ORG.
-    const other = await createTestUser({ email: 'other@iproofnow.dev' });
-    await createTestProof(other.user.id, { title: 'theirs', visibility: 'ORG' });
+    // Org-mate's ORG-visible proof would show up under /api/proofs, but
+    // vault is deliberately owner-only — it must not appear here.
+    const mate = await createTestUser({ email: 'mate@iproofnow.dev', role: 'COMPANY' });
+    await joinOrg(mate.user.id, org.id);
+    await createTestProof(mate.user.id, {
+      title: 'theirs',
+      orgId: org.id,
+      visibility: 'ORG',
+    });
 
     const res = await vaultList(vaultReq());
     expect(res.status).toBe(200);
