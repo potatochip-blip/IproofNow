@@ -38,15 +38,17 @@ const TIER_DB_TO_FRONTEND: Record<SubscriptionTier, FrontendSubscriptionTier> = 
 };
 
 export function roleToFrontend(role: Role): FrontendRole {
-  return ROLE_DB_TO_FRONTEND[role];
+  // Records keyed on a closed enum are exhaustive; non-null is the standard
+  // workaround for `noUncheckedIndexedAccess`.
+  return ROLE_DB_TO_FRONTEND[role]!;
 }
 
 export function roleFromFrontend(role: FrontendRole): Role {
-  return ROLE_FRONTEND_TO_DB[role];
+  return ROLE_FRONTEND_TO_DB[role]!;
 }
 
 export function tierToFrontend(tier: SubscriptionTier): FrontendSubscriptionTier {
-  return TIER_DB_TO_FRONTEND[tier];
+  return TIER_DB_TO_FRONTEND[tier]!;
 }
 
 export type SerializedUser = {

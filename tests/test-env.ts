@@ -7,11 +7,12 @@
 import { vi, beforeEach } from 'vitest';
 import { resetCookieJar } from './cookie-jar';
 
-if (!process.env.DATABASE_URL_TEST) {
+if (!process.env['DATABASE_URL_TEST']) {
   throw new Error('DATABASE_URL_TEST must be set for tests (see .env.example)');
 }
-process.env.DATABASE_URL = process.env.DATABASE_URL_TEST;
-process.env.NODE_ENV = 'test';
+process.env['DATABASE_URL'] = process.env['DATABASE_URL_TEST'];
+// @types/node v20+ types NODE_ENV as a readonly literal. Object.assign sidesteps it.
+Object.assign(process.env, { NODE_ENV: 'test' });
 
 vi.mock('next/headers', async () => {
   const { mockCookies } = await import('./cookie-jar');

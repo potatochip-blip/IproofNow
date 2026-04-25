@@ -53,15 +53,19 @@ export async function GET(req: NextRequest, ctx: RouteCtx) {
       prisma.verificationRecord.groupBy({
         by: ['result'],
         where,
-        _count: { _all: true },
+        _count: true,
+        orderBy: { result: 'asc' },
       }),
     ]);
 
     const counts = { verified: 0, notFound: 0, tampered: 0 };
     for (const g of grouped) {
-      if (g.result === 'verified') counts.verified = g._count._all;
-      else if (g.result === 'not_found') counts.notFound = g._count._all;
-      else if (g.result === 'tampered') counts.tampered = g._count._all;
+      // _count is a number when groupBy is called with `_count: true`, but
+      // Prisma's generic typing surfaces it as a union — coerce explicitly.
+      const n = g._count as number;
+      if (g.result === 'verified') counts.verified = n;
+      else if (g.result === 'not_found') counts.notFound = n;
+      else if (g.result === 'tampered') counts.tampered = n;
     }
 
     const verifications: VerificationSummary[] = rows.map((r) => ({

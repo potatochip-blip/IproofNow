@@ -33,15 +33,17 @@ const HASH_STATUS_TO_FRONTEND: Record<HashStatus, FrontendHashStatus> = {
 };
 
 export function proofStatusToFrontend(s: ProofStatus): FrontendProofStatus {
-  return STATUS_TO_FRONTEND[s];
+  // Records keyed on a closed enum are exhaustive; non-null is the standard
+  // workaround for `noUncheckedIndexedAccess`.
+  return STATUS_TO_FRONTEND[s]!;
 }
 
 export function visibilityToFrontend(v: Visibility): FrontendVisibility {
-  return VISIBILITY_TO_FRONTEND[v];
+  return VISIBILITY_TO_FRONTEND[v]!;
 }
 
 export function hashStatusToFrontend(h: HashStatus): FrontendHashStatus {
-  return HASH_STATUS_TO_FRONTEND[h];
+  return HASH_STATUS_TO_FRONTEND[h]!;
 }
 
 // ─── Serialized shapes ────────────────────────────────────────────────────

@@ -72,7 +72,10 @@ export function buildMultipartRequest(
   mimeType: string
 ): Request {
   const form = new FormData();
-  const blob = new Blob([fileBytes], { type: mimeType });
+  // Cast: lib.dom's BlobPart wants Uint8Array<ArrayBuffer> specifically,
+  // but @types/node widens our input to Uint8Array<ArrayBufferLike>.
+  // Runtime-equivalent — the bytes are the same.
+  const blob = new Blob([fileBytes as BlobPart], { type: mimeType });
   form.append('file', blob, filename);
   return new Request(url, { method: 'POST', body: form });
 }
