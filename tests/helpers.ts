@@ -1,4 +1,16 @@
-import { PrismaClient, type Notification, type Organization, type Proof, type Role, type User, type VerificationRecord } from '@prisma/client';
+import {
+  PrismaClient,
+  type Case,
+  type CaseProof,
+  type EvidencePackage,
+  type Notification,
+  type Organization,
+  type PackageStatus,
+  type Proof,
+  type Role,
+  type User,
+  type VerificationRecord,
+} from '@prisma/client';
 import { hashPassword } from '@/lib/password';
 import { createSession, generateSessionToken } from '@/lib/session';
 import { seedCookie } from './cookie-jar';
@@ -153,6 +165,57 @@ export async function createTestVerification(
       proofId,
       method: overrides.method ?? 'hash',
       result: overrides.result ?? 'verified',
+    },
+  });
+}
+
+export async function createTestCase(
+  ownerUserId: string,
+  overrides: Partial<{
+    title: string;
+    description: string;
+    status: string;
+    orgId: string | null;
+  }> = {}
+): Promise<Case> {
+  return db().case.create({
+    data: {
+      ownerUserId,
+      title: overrides.title ?? 'Test Case',
+      description: overrides.description ?? '',
+      status: overrides.status ?? 'active',
+      orgId: overrides.orgId ?? null,
+    },
+  });
+}
+
+export async function linkCaseProof(
+  caseId: string,
+  proofId: string
+): Promise<CaseProof> {
+  return db().caseProof.create({ data: { caseId, proofId } });
+}
+
+export async function createTestPackage(
+  createdByUserId: string,
+  overrides: Partial<{
+    caseId: string | null;
+    proofId: string | null;
+    packageType: string;
+    status: PackageStatus;
+    storagePath: string | null;
+  }> = {}
+): Promise<EvidencePackage> {
+  return db().evidencePackage.create({
+    data: {
+      createdByUserId,
+      caseId: overrides.caseId ?? null,
+      proofId: overrides.proofId ?? null,
+      packageType: overrides.packageType ?? 'court_bundle',
+      ...(overrides.status ? { status: overrides.status } : {}),
+      ...(overrides.storagePath !== undefined
+        ? { storagePath: overrides.storagePath }
+        : {}),
     },
   });
 }
