@@ -7,9 +7,15 @@ import { logger } from './logger';
  * silently break icon / route mapping. Document additions in CLAUDE.md.
  *
  * Phase 3: 'proof_sealed'.
+ * Phase 4: 'evidence_package_requested' — fired on POST
+ *          /api/cases/:caseId/packages; recipient is the case owner so they
+ *          know someone on their team kicked off a package build. Self-notify
+ *          is intentional (mirrors proof_sealed) — owner-initiated requests
+ *          still produce a notification because the package surface itself
+ *          is async.
  * Future: 'proof_verified_public', 'evidence_package_ready', 'case_shared', ...
  */
-export type NotificationType = 'proof_sealed';
+export type NotificationType = 'proof_sealed' | 'evidence_package_requested';
 
 export type CreateNotificationInput = {
   userId: string;
