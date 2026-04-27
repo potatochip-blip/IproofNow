@@ -58,6 +58,12 @@ app/
     notifications/[notificationId]/route.ts     # PATCH read/unread
     notifications/read-all/route.ts             # mark-all
     audit/route.ts                              # actor-scoped audit query (admin sees all)
+    cases/route.ts                              # create + list (owned ∪ same-org, q+status filter)
+    cases/[caseId]/route.ts                     # detail + PATCH (owner-only)
+    cases/[caseId]/proofs/route.ts              # POST link (atomic per-batch)
+    cases/[caseId]/proofs/[proofId]/route.ts    # DELETE unlink
+    cases/[caseId]/packages/route.ts            # POST request + GET list
+    packages/[packageId]/route.ts               # detail (downloadUrl when READY)
 lib/
   db.ts                      # Prisma client singleton
   session.ts                 # generateSessionToken, createSession, validate (sliding refresh), invalidate*
@@ -66,7 +72,10 @@ lib/
   serializers.ts             # Role/Tier enum ↔ frontend casing, serializeUser()
   proof-serializers.ts       # Proof/File/Attestation ↔ frontend (async — signs download URLs)
   proof-guards.ts            # loadProofForRead/Write/Verify + assertNotSealed (hidden-vault 404)
-  proof-search.ts            # q+filter Prisma where composer (route-agnostic; reusable Phase 4)
+  proof-search.ts            # q+filter Prisma where composer for Proof (route-agnostic)
+  case-guards.ts             # loadCaseForRead/Write + caseIsOwner/SameOrg helpers
+  case-serializers.ts        # Case + Package ↔ frontend (Package status enum)
+  case-search.ts             # q+filter Prisma where composer for Case
   notifications.ts           # createNotification + NotificationType closed union
   storage.ts                 # S3Client singleton + putObject + presigned GET (MinIO via forcePathStyle)
   guards.ts                  # getCurrentSession, requireSession, requireRole(...roles)
@@ -81,8 +90,8 @@ tests/
   global-setup.ts            # prisma db push --force-reset against *_test DB
   test-env.ts                # mocks next/headers cookies(); pins NODE_ENV=test
   cookie-jar.ts              # in-memory jar that quacks like cookies()
-  helpers.ts                 # truncateAll, createTestUser, loginAs, createTestOrg, createTestProof, buildJsonRequest, buildMultipartRequest
-  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts
+  helpers.ts                 # truncateAll, createTestUser/Org/Proof/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
@@ -292,6 +301,56 @@ to un-hide permanently, that's a `PATCH /api/proofs/:id` with
 
 ---
 
+## API contracts (Phase 4 — Cases + Case↔Proof + Evidence Packages)
+
+### Endpoints
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `POST`   | `/api/cases` | required | body `{title, description?, orgId?}`. Inherits `orgId` from caller if not given. 201 → `{ case }`. Audits `case.created`. |
+| `GET`    | `/api/cases` | required | `?scope=(owned\|org)&q=&status=&page=&pageSize=`. Default scope = owned ∪ same-org. `q` ILIKE on title+description; `status` exact match. `?scope=org` with no `user.orgId` short-circuits to an empty page. Each row carries `linkedProofCount` + `packageCount`. No audit. |
+| `GET`    | `/api/cases/:caseId` | required | Owner OR same-org → 200; otherwise 404 (don't leak existence). Response: `{ case, proofs: ProofSummary[], packages: PackageSummary[] }`. **Linked-proof projection differs by access path** — owner sees every linked proof; same-org peers see only non-PRIVATE non-hidden linked proofs (mirrors the `/api/proofs` ladder). No audit in Phase 4. |
+| `PATCH`  | `/api/cases/:caseId` | required | Owner-only (403 otherwise; 404 missing). Updatable: `title`, `description`, `status`. Empty body → 400. Audits `case.updated` with `meta.fields` (touched keys only, no values). |
+| `POST`   | `/api/cases/:caseId/proofs` | required | Case-owner only. Body `{ proofIds: string[] }`. **Atomic** — every proof must exist AND be owned by the caller; one foreign / missing id rolls back the whole batch (no partial links, no audit rows). Idempotent re-link via the `(caseId,proofId)` unique constraint; audits fire only for newly-created links. 201 → `{ linked: number }`. Audits `case.proof.linked` once per added proof. |
+| `DELETE` | `/api/cases/:caseId/proofs/:proofId` | required | Case-owner only. 204 on success; 404 when the link doesn't exist. Audits `case.proof.unlinked`. |
+| `POST`   | `/api/cases/:caseId/packages` | required | Case owner OR (same-org AND role ∈ {LAWYER, LAW_ENFORCEMENT}). Body `{ packageType: 'court_bundle'\|'discovery'\|'custom' }`. **Phase 4 stub** — synchronously writes a row at status=PENDING. The actual zip-assembly worker is Phase 5. 202 → `{ packageId, status: 'pending' }`. Audits `package.requested`. Notifies case owner with `evidence_package_requested`. |
+| `GET`    | `/api/cases/:caseId/packages` | required | Same access as case detail. 200 → `{ packages: PackageSummary[] }`. No audit. |
+| `GET`    | `/api/packages/:packageId` | required | Package creator OR case owner OR same-org as case. Otherwise 404. Response: `{ package, downloadUrl? }`. `downloadUrl` is **only present at the top level** when status=READY AND storagePath is populated — keeps the frontend's "do I have a link?" check a simple `'downloadUrl' in res`. No audit. |
+
+### Why per-entity search files
+
+Phase 4 generalized search by **splitting**, not bolting: `lib/case-search.ts`
+sits next to `lib/proof-search.ts` rather than absorbing it. Each entity
+will accumulate its own column quirks (peopleInvolved tag matching for
+proofs; case status taxonomy here) and a single helper would force every
+caller to opt out of irrelevant joins. Keep them separate.
+
+### Case write vs read symmetry
+
+Read leaks nothing: foreign caller → 404 (mirrors hidden-vault rule).
+Write does leak existence: foreign caller → 403, not 404. Cases don't
+have a hidden-vault analogue, and a 403 on PATCH is acceptable signal
+loss versus the cost of rerouting writes through `loadCaseForRead` first.
+If we ever add a "case sealed" or "case archived & locked" state where
+existence becomes sensitive, revisit.
+
+### `case.detail.viewed` is reserved
+
+Owner / same-org reads are routine and not audited in Phase 4. The
+`case.detail.viewed` action is reserved for a future share grant
+mechanism in which a non-owner gains access via an explicit share. The
+`GET /api/cases/:caseId` handler carries a `// TODO(phase-share):` stub
+at the audit emit point so the wiring is obvious when share lands.
+
+### Package recipient (`evidence_package_requested`)
+
+Recipient is the **case owner**, regardless of who initiated. When the
+owner self-requests we still notify — package builds are async, so a
+notification is the only consistent signal that something is in flight.
+Mirrors the `proof_sealed` self-notify pattern.
+
+---
+
 ## Notification types
 
 Closed enum — frontend branches on `type` to pick icons and route targets,
@@ -302,6 +361,12 @@ change.
   owner. `href = /proofs/:id`. Self-notify is intentionally in today; when
   the frontend wires up richer recipients (org-mates on ORG proofs, case
   collaborators) the recipient set expands here.
+- `evidence_package_requested` — emitted on `POST /api/cases/:id/packages`.
+  Recipient = **case owner** (regardless of who initiated). `href =
+  /cases/:id`. Self-notify is intentional and mirrors `proof_sealed`:
+  package builds are async, so a notification is the only consistent
+  signal that work is in flight. Phase 5 will add `evidence_package_ready`
+  when the worker finishes.
 
 Additions must update this list **and** the `NotificationType` union in
 `lib/notifications.ts`. Like audit actions, these are a versioned contract.
@@ -384,6 +449,19 @@ Explicitly **not** audited in Phase 3: GET /api/vault (default scope),
 GET /api/notifications, notification PATCH, notification read-all,
 GET /api/proofs/:id/verifications (metadata read — the underlying
 proof's access check already gates it).
+
+**Phase 4 audited actions**:
+
+- `case.created` — state change on POST /api/cases; `meta.orgId`
+- `case.updated` — state change on PATCH; `meta.fields` lists touched keys (no values)
+- `case.proof.linked` — state change; **one row per added proof** with `meta.proofId`. Skipped duplicates do not audit.
+- `case.proof.unlinked` — state change; `meta.proofId`
+- `package.requested` — state change on POST /api/cases/:id/packages; `meta.packageType`, `meta.caseId`
+- `case.detail.viewed` — **reserved**, not emitted in Phase 4. Reserved for the future share-grant code path: a non-owner gaining read access via an explicit grant should audit. Owner / same-org reads stay routine.
+
+Explicitly **not** audited in Phase 4: GET /api/cases (any scope),
+GET /api/cases/:id (owner / same-org), GET /api/cases/:id/packages,
+GET /api/packages/:id.
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -488,5 +566,17 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       New audit actions: `proof.hidden.revealed`, `proof.verified`,
       `audit.queried`. `NotificationType = 'proof_sealed'` (closed enum).
       Seal now emits a `proof_sealed` notification to the owner.
-- [ ] Phase 4 — Cases, evidence packages, exports.
-- [ ] Phase 5+ — Background jobs, OpenTimestamps batching, hardening.
+- [x] **Phase 4 — Cases + Case↔Proof + Evidence Packages**: `/api/cases`
+      CRUD (owned ∪ same-org list with `q`+`status`, owner-only PATCH),
+      `/api/cases/[id]/proofs` atomic batch link / unlink (one foreign id
+      rolls back the whole batch), `/api/cases/[id]/packages` request
+      stub (PENDING row + 202; worker is Phase 5) + list,
+      `/api/packages/[id]` detail with `downloadUrl` only when READY.
+      `lib/{case-guards,case-serializers,case-search}`. New audit actions:
+      `case.created`, `case.updated`, `case.proof.linked`,
+      `case.proof.unlinked`, `package.requested`. `case.detail.viewed`
+      reserved (TODO stub) for the future share-grant flow.
+      `NotificationType += 'evidence_package_requested'` (recipient =
+      case owner, regardless of who initiated).
+- [ ] Phase 5+ — Background jobs (package builder, OpenTimestamps
+      batching), hardening, exports.
