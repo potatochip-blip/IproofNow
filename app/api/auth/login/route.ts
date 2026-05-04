@@ -6,7 +6,9 @@ import { createSession, generateSessionToken } from '@/lib/session';
 import { setSessionCookie } from '@/lib/cookies';
 import { serializeUser } from '@/lib/serializers';
 import { writeAudit } from '@/lib/audit';
-import { errorResponse, UnauthorizedError } from '@/lib/errors';
+import { errorResponse, TooManyRequestsError, UnauthorizedError } from '@/lib/errors';
+import { consume, ipKey } from '@/lib/rate-limit';
+import { normalizeEmail } from '@/lib/user-email';
 
 const LoginBody = z.object({
   email: z.string().email().max(254),
@@ -15,11 +17,27 @@ const LoginBody = z.object({
 
 export async function POST(req: NextRequest) {
   try {
+    // Rate limit BEFORE the password verify (argon2 is intentionally slow,
+    // so unbounded attempts amplify the asymmetry against the server). 5
+    // attempts / 15 min / IP is the OWASP login default.
+    const key = ipKey(req);
+    if (!consume(key)) {
+      await writeAudit({
+        actorUserId: null,
+        entityType: 'User',
+        entityId: 'unknown',
+        action: 'auth.login.failure',
+        meta: { reason: 'rate_limited', ipKey: key },
+      });
+      throw new TooManyRequestsError('Too many login attempts; try again later');
+    }
+
     const json = await req.json().catch(() => ({}));
-    const { email, password } = LoginBody.parse(json);
+    const { email: rawEmail, password } = LoginBody.parse(json);
+    const email = normalizeEmail(rawEmail);
 
     const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
+      where: { email },
       include: { org: { select: { id: true, name: true } } },
     });
 
@@ -29,7 +47,7 @@ export async function POST(req: NextRequest) {
         entityType: 'User',
         entityId: 'unknown',
         action: 'auth.login.failure',
-        meta: { email: email.toLowerCase(), reason: 'no_such_user' },
+        meta: { email, reason: 'no_such_user' },
       });
       throw new UnauthorizedError('Invalid email or password');
     }

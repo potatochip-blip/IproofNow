@@ -51,6 +51,13 @@ export class ValidationError extends ApiError {
   }
 }
 
+export class TooManyRequestsError extends ApiError {
+  constructor(message = 'Too many requests') {
+    super(429, 'TOO_MANY_REQUESTS', message);
+    this.name = 'TooManyRequestsError';
+  }
+}
+
 type ErrorBody = {
   error: { code: string; message: string; details?: unknown };
 };
