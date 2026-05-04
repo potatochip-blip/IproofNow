@@ -1,5 +1,6 @@
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { Readable } from 'node:stream';
 import { logger } from './logger';
 
 function required(name: string): string {
@@ -52,6 +53,22 @@ export async function getPresignedGetUrl(key: string, ttlSec = 900): Promise<str
     new GetObjectCommand({ Bucket: getBucket(), Key: key }),
     { expiresIn: ttlSec }
   );
+}
+
+/**
+ * Stream an object out of S3. Used by the hash worker (sha256 a multi-MB
+ * file without buffering it) and the package builder (pipe each proof file
+ * into the zip). Throws if the object is missing.
+ */
+export async function getObjectStream(key: string): Promise<Readable> {
+  const client = getS3Client();
+  const res = await client.send(
+    new GetObjectCommand({ Bucket: getBucket(), Key: key })
+  );
+  if (!res.Body) throw new Error(`No body returned for ${key}`);
+  // SDK v3 types Body as union of Readable | ReadableStream | Blob; in Node
+  // it's always Readable. Cast preserves stream semantics for the caller.
+  return res.Body as Readable;
 }
 
 /** Used by tests to decide whether to skip file-upload cases. */
