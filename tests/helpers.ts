@@ -30,8 +30,8 @@ export async function truncateAll(): Promise<void> {
   await p.$executeRawUnsafe(`
     TRUNCATE TABLE
       "AuditLog","VerificationRecord","CaseProof","EvidencePackage",
-      "ProofAttestation","ProofFile","PreservationConfig","Notification",
-      "Proof","Case","Session","Organization","User"
+      "ProofAttestation","ProofFile","PreservationConfig","ProofAnchor",
+      "Notification","Job","Proof","Case","Session","Organization","User"
     RESTART IDENTITY CASCADE;
   `);
 }

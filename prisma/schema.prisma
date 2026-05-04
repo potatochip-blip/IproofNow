@@ -51,6 +51,13 @@ enum HashStatus {
   FAILED
 }
 
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETE
+  FAILED
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────
 
 model User {
@@ -137,6 +144,7 @@ model Proof {
   verifications    VerificationRecord[]
   caseLinks        CaseProof[]
   preservation     PreservationConfig?
+  anchor           ProofAnchor?
   evidencePackages EvidencePackage[]
 
   @@index([ownerUserId])
@@ -281,6 +289,40 @@ model PreservationConfig {
   hiddenVaultMode  Boolean  @default(false)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+
+  proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
+}
+
+// ─── Phase 5: Background jobs ────────────────────────────────────────────
+//
+// Generic queue row, claimed via Postgres `SELECT … FOR UPDATE SKIP LOCKED`
+// inside lib/jobs.ts. payload shape is per-job-type and validated in the
+// handler rather than the schema. attempts increments on each claim, and
+// terminal failure flips status to FAILED with lastError populated.
+model Job {
+  id          String    @id @default(cuid())
+  type        String
+  payload     Json      @default("{}")
+  status      JobStatus @default(PENDING)
+  attempts    Int       @default(0)
+  lastError   String?
+  runAfter    DateTime  @default(now())
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  completedAt DateTime?
+
+  @@index([status, runAfter])
+}
+
+// Phase 5 stores stub anchors (status='STUB') with a deterministic
+// pseudo-otsProof. Phase 7's OpenTimestamps integration will overwrite
+// otsProof with a real OTS receipt and flip status='CONFIRMED'.
+model ProofAnchor {
+  id         String   @id @default(cuid())
+  proofId    String   @unique
+  otsProof   Bytes
+  status     String   @default("STUB")
+  anchoredAt DateTime @default(now())
 
   proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
 }
