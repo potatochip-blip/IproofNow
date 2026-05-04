@@ -62,8 +62,9 @@ app/
     cases/[caseId]/route.ts                     # detail + PATCH (owner-only)
     cases/[caseId]/proofs/route.ts              # POST link (atomic per-batch)
     cases/[caseId]/proofs/[proofId]/route.ts    # DELETE unlink
-    cases/[caseId]/packages/route.ts            # POST request + GET list
+    cases/[caseId]/packages/route.ts            # POST request (atomic with job enqueue) + GET list
     packages/[packageId]/route.ts               # detail (downloadUrl when READY)
+    proofs/[proofId]/export/route.ts            # JSON export (audited)
 lib/
   db.ts                      # Prisma client singleton
   session.ts                 # generateSessionToken, createSession, validate (sliding refresh), invalidate*
@@ -77,42 +78,56 @@ lib/
   case-serializers.ts        # Case + Package ↔ frontend (Package status enum)
   case-search.ts             # q+filter Prisma where composer for Case
   notifications.ts           # createNotification + NotificationType closed union
-  storage.ts                 # S3Client singleton + putObject + presigned GET (MinIO via forcePathStyle)
+  storage.ts                 # S3Client singleton + putObject + getObjectStream + presigned GET (MinIO via forcePathStyle)
+  jobs.ts                    # enqueueJob/runDueJobs/drainJobs (FOR UPDATE SKIP LOCKED + retry backoff)
+  jobs/hash-file.ts          # proof_file.hash → fills ProofFile.fileHash + hashStatus
+  jobs/build-package.ts      # evidence_package.build → zips manifest + files to S3, notifies owner
+  jobs/anchor.ts             # proof.anchor → Phase 5 OpenTimestamps STUB (Phase 7 replaces)
+  rate-limit.ts              # in-memory token bucket (login throttle; Redis swap in prod)
+  user-email.ts              # normalizeEmail() — single boundary for User.email writes/reads
   guards.ts                  # getCurrentSession, requireSession, requireRole(...roles)
-  errors.ts                  # ApiError + typed subclasses + errorResponse()
+  errors.ts                  # ApiError + typed subclasses + errorResponse() (incl. TooManyRequestsError)
   audit.ts                   # writeAudit() — fire-and-log, never throws
   logger.ts                  # JSON line logger
 middleware.ts                # CORS for /api/* (allowlist + credentials)
 prisma/
-  schema.prisma              # 13 entities + 6 enums
+  schema.prisma              # 15 entities + 7 enums
   seed.ts                    # 6 users (one per role); refuses to run in production
 tests/
   global-setup.ts            # prisma db push --force-reset against *_test DB
   test-env.ts                # mocks next/headers cookies(); pins NODE_ENV=test
   cookie-jar.ts              # in-memory jar that quacks like cookies()
   helpers.ts                 # truncateAll, createTestUser/Org/Proof/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
-  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
 
 ---
 
-## Entity summary (13 models)
+## Entity summary (15 models)
 
 `User`, `Organization`, `Session`, `Proof`, `ProofFile`, `ProofAttestation`,
 `VerificationRecord`, `Notification`, `Case`, `CaseProof`, `EvidencePackage`,
-`AuditLog`, `PreservationConfig`.
+`AuditLog`, `PreservationConfig`, `Job`, `ProofAnchor`.
 
 Enums: `Role` (INDIVIDUAL|COMPANY|LAWYER|LAW_ENFORCEMENT|GOVERNMENT|ADMIN),
 `ProofStatus` (DRAFT|SEALED), `Visibility` (PRIVATE|PUBLIC|ORG),
 `PackageStatus` (PENDING|READY|FAILED), `SubscriptionTier`
-(FREE|PRO|BUSINESS|ENTERPRISE), `HashStatus` (PENDING|COMPLETE|FAILED).
+(FREE|PRO|BUSINESS|ENTERPRISE), `HashStatus` (PENDING|COMPLETE|FAILED),
+`JobStatus` (PENDING|RUNNING|COMPLETE|FAILED).
 
 **Phase 2 schema additions**: `Proof.roleContext String?` (freeform role
 context on draft creation); `ProofFile.hashStatus HashStatus @default(PENDING)`
 (lets the frontend distinguish "not computed yet" from "failed" from
-"legacy"; Phase 6 worker flips to COMPLETE when `fileHash` is populated).
+"legacy"; the Phase 5 hash worker flips to COMPLETE when `fileHash` is
+populated).
+
+**Phase 5 schema additions**: `Job` (generic queue row, claimed via
+`SELECT … FOR UPDATE SKIP LOCKED`); `ProofAnchor` (1:1 with Proof,
+Phase 5 writes status='STUB' rows from the anchor stub worker — Phase 7
+overwrites otsProof with a real OpenTimestamps receipt and flips
+status='CONFIRMED').
 
 Every FK is indexed. Common query columns indexed: `Proof.ownerUserId`,
 `Proof.orgId`, `(Proof.ownerUserId,status)`, `(Proof.orgId,status)`,
@@ -351,6 +366,99 @@ Mirrors the `proof_sealed` self-notify pattern.
 
 ---
 
+## API contracts (Phase 5 — Background jobs + Hardening + Exports)
+
+### Endpoints
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/proofs/:proofId/export` | required | Same access ladder as `loadProofForRead` (owner / same-org-non-PRIVATE / PUBLIC; hidden-vault → 404 to non-owners). Response: `{ proof, anchor }` where `anchor` is `{ status, anchoredAt, otsProof: base64 }` or `null`. Audits `proof.exported` with `meta.fileCount`, `meta.hasAttestation`, `meta.anchored`. |
+
+### Routes that gained side effects
+
+| Method | Path | New behavior |
+| --- | --- | --- |
+| `POST` | `/api/proofs/:id/seal` | Wraps SEALED transition + `proof.anchor` enqueue in a single `prisma.$transaction` so a row stamped SEALED implies a job is queued. |
+| `POST` | `/api/proofs/:id/files` | Enqueues `proof_file.hash` after the file row finalizes. Best-effort — enqueue failure logs via `writeAudit({action:'job.failed', stage:'enqueue'})` but never breaks the upload response. |
+| `POST` | `/api/cases/:id/packages` | Wraps `EvidencePackage` create + `evidence_package.build` enqueue in `prisma.$transaction` so the PENDING row + the job row are atomic. |
+| `POST` | `/api/auth/login` | Rate-limited via `consume(ipKey)` BEFORE the argon2 verify — 5 attempts / 15min / IP. 429 → `auth.login.failure` audit with `meta.reason='rate_limited'`. Email lookup now goes through `normalizeEmail()`. |
+| `middleware.ts` | (all `/api/*`) | Rejects requests with `Content-Length > 100MB` with 413 before Next routes the body to a handler. |
+
+### Job system (`lib/jobs.ts`)
+
+Public surface is just three functions:
+- `enqueueJob(type, payload, { runAfter?, tx? })` — `tx` lets callers
+  enqueue inside their own transaction (used by seal / upload / package
+  request) so "state change ↔ job exists" stays atomic.
+- `runDueJobs()` — claim one due `Job` via raw SQL with
+  `SELECT … FOR UPDATE SKIP LOCKED` so multiple worker instances are safe
+  by default. Handler runs OUTSIDE the transaction so a slow handler
+  doesn't hold the row lock.
+- `drainJobs(maxIterations=50)` — loops `runDueJobs()` until idle, with
+  a hard cap so a broken handler can't hang the suite. Test/ops helper.
+
+Retry policy: max 3 attempts, exponential backoff (1s → 4s → terminal
+FAILED). Terminal FAILED writes an internal `job.failed` audit row with
+the truncated error so ops can spot persistently-broken handlers without
+scraping logs.
+
+**Critical Postgres footgun**: the SKIP-LOCKED claim compares
+`"runAfter"` against `(NOW() AT TIME ZONE 'UTC')::timestamp`, NOT plain
+NOW(). Prisma stores `DateTime` as `timestamp(3)` (no tz) interpreted as
+UTC, but a session-local NOW() cast to `timestamp` shifts by the session
+TZ — so a non-UTC session would silently filter out rows that were due
+"now". The explicit AT TIME ZONE conversion compares wall-clocks in the
+same frame regardless of session timezone. **Don't remove this without
+re-running tests on a non-UTC session** (e.g. `SET TimeZone =
+'America/New_York'`).
+
+### Cron tick is operational config
+
+`runDueJobs()` is exposed; how it gets called in prod is not Phase 5's
+problem. Common options: `setInterval(runDueJobs, 5000)` in a sidecar
+process, a Kubernetes CronJob hitting an `/api/_internal/runJobs`
+endpoint, or a real queue once load demands it. The handler interface
+(`(payload, ctx) => Promise<void>`) doesn't change with any of those.
+
+### Job handler registry
+
+Three handlers ship in Phase 5, registered via dynamic import inside
+`lib/jobs.ts → loadHandlers()`:
+
+- `proof_file.hash` (`lib/jobs/hash-file.ts`) — streams the S3 object
+  through `createHash('sha256')` rather than buffering, writes back
+  `ProofFile.fileHash` and flips `hashStatus` PENDING → COMPLETE/FAILED.
+  Missing file (deleted between enqueue and run) is a terminal no-op.
+- `evidence_package.build` (`lib/jobs/build-package.ts`) — uses
+  `archiver` to stream `manifest.json` + every linked proof's files into
+  a zip on S3, flips `EvidencePackage` to READY + populates
+  `storagePath`, notifies the case owner with `evidence_package_ready`.
+  Missing package id is a terminal no-op. Mid-zip throws retry; only the
+  3rd (terminal) attempt flips the EvidencePackage row to FAILED so
+  transient S3 hiccups don't toggle READY/FAILED on every retry.
+- `proof.anchor` (`lib/jobs/anchor.ts`) — Phase 5 stub. Writes a
+  `ProofAnchor` row with `status='STUB'` and a deterministic pseudo-
+  otsProof = `sha256(proofId)`. Idempotent via upsert on the unique
+  proofId. Phase 7 replaces this with real OpenTimestamps submission.
+
+### Hardening
+
+- **Login rate limit** (`lib/rate-limit.ts`): in-memory token bucket, 5
+  attempts / 15min / IP. Tests pass an isolated `Map` + `now()` override
+  to avoid leaking state between cases. Prod with horizontal scaling
+  swaps the Map for Redis (`INCR key EX windowSec`) — call site stays
+  identical. The gate runs BEFORE argon2 verify so brute-force attempts
+  can't amplify the intentional verify slowness against the server.
+- **Body cap** (`middleware.ts`): rejects `Content-Length > 100MB` with
+  413 before the multipart parser sees the body. Per-file route still
+  enforces its own limit for chunked / lying clients.
+- **Email normalization** (`lib/user-email.ts`): single `normalizeEmail`
+  helper used at every User-creation / lookup site. Keeps the `email`
+  unique constraint from accumulating mixed-case duplicates without
+  depending on Postgres `citext`.
+
+---
+
 ## Notification types
 
 Closed enum — frontend branches on `type` to pick icons and route targets,
@@ -365,8 +473,12 @@ change.
   Recipient = **case owner** (regardless of who initiated). `href =
   /cases/:id`. Self-notify is intentional and mirrors `proof_sealed`:
   package builds are async, so a notification is the only consistent
-  signal that work is in flight. Phase 5 will add `evidence_package_ready`
-  when the worker finishes.
+  signal that work is in flight.
+- `evidence_package_ready` — emitted by `lib/jobs/build-package.ts` on
+  successful upload of the zip to S3. Recipient = **case owner**. `href
+  = /cases/:id`. Closes the loop opened by `evidence_package_requested`.
+  Failures emit no notification — the package row's status flips to
+  FAILED and a successful retry will replay the signal.
 
 Additions must update this list **and** the `NotificationType` union in
 `lib/notifications.ts`. Like audit actions, these are a versioned contract.
@@ -462,6 +574,18 @@ proof's access check already gates it).
 Explicitly **not** audited in Phase 4: GET /api/cases (any scope),
 GET /api/cases/:id (owner / same-org), GET /api/cases/:id/packages,
 GET /api/packages/:id.
+
+**Phase 5 audited actions**:
+
+- `proof.exported` — **sensitive read** on GET /api/proofs/:id/export; `meta.fileCount`, `meta.hasAttestation`, `meta.anchored` (enough for a reviewer to know what left the system without dumping the payload itself).
+- `job.failed` — **internal-only**, fire-and-log: emitted by `lib/jobs.ts` when a Job hits its terminal failure (3rd attempt). `entityType='Job'`, `entityId=jobId`, `meta.type` (the job type), `meta.attempts`, `meta.error` (truncated to 1KB). Lets ops see "type X dies on attempt 3" without scraping logs. The handlers themselves don't write `job.failed` — the runner owns it.
+- `auth.login.failure` (extended) — now also emitted with `meta.reason='rate_limited'` when the IP-token-bucket gate rejects a login before argon2 verify; `meta.ipKey` carries the bucket key so ops can correlate without scraping middleware logs.
+
+Explicitly **not** audited in Phase 5: GET /api/proofs/:id (owner / same-org),
+job retries that aren't terminal (intermediate `RUNNING → PENDING` cycles),
+successful job COMPLETE transitions (the handlers' state changes — package
+ready, file hashed, proof anchored — are observable through their own
+domain rows / notifications).
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -578,5 +702,21 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       reserved (TODO stub) for the future share-grant flow.
       `NotificationType += 'evidence_package_requested'` (recipient =
       case owner, regardless of who initiated).
-- [ ] Phase 5+ — Background jobs (package builder, OpenTimestamps
-      batching), hardening, exports.
+- [x] **Phase 5 — Background jobs + Hardening + Exports**: `lib/jobs.ts`
+      (FOR UPDATE SKIP LOCKED claim, retry+backoff, terminal `job.failed`
+      audit), three handlers — `proof_file.hash` (fills `ProofFile.fileHash`
+      + flips `hashStatus`), `evidence_package.build` (archiver-based zip
+      builder; manifest.json + per-proof files; flips package READY +
+      notifies owner), `proof.anchor` (Phase 5 STUB writing deterministic
+      `sha256(proofId)` to `ProofAnchor`; Phase 7 swaps in real OTS).
+      Seal/upload/package-request handlers all enqueue inside their own
+      transactions so state-change ↔ job-row stays atomic. New endpoint
+      `GET /api/proofs/[id]/export` (audited as `proof.exported`).
+      Hardening: login-IP token bucket + 100MB body cap in middleware +
+      `lib/user-email.ts` normalization helper + `TooManyRequestsError`
+      (429). Schema additions: `Job` model + `JobStatus` enum + `ProofAnchor`
+      model. `NotificationType += 'evidence_package_ready'`. New audit
+      actions: `proof.exported`, `job.failed`, plus rate-limited login
+      audited via existing `auth.login.failure` with `meta.reason='rate_limited'`.
+- [ ] Phase 6+ — Verification chain hardening, audit immutability,
+      KMS-style signed audit entries.
