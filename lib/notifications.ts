@@ -13,9 +13,17 @@ import { logger } from './logger';
  *          is intentional (mirrors proof_sealed) — owner-initiated requests
  *          still produce a notification because the package surface itself
  *          is async.
- * Future: 'proof_verified_public', 'evidence_package_ready', 'case_shared', ...
+ * Phase 5: 'evidence_package_ready' — fired by the build-package worker on
+ *          successful upload to S3. Recipient = case owner. Closes the loop
+ *          opened by 'evidence_package_requested'. Failures emit no
+ *          notification — the package row's status flips to FAILED and a
+ *          retry will replay this signal once the worker succeeds.
+ * Future: 'proof_verified_public', 'case_shared', ...
  */
-export type NotificationType = 'proof_sealed' | 'evidence_package_requested';
+export type NotificationType =
+  | 'proof_sealed'
+  | 'evidence_package_requested'
+  | 'evidence_package_ready';
 
 export type CreateNotificationInput = {
   userId: string;
