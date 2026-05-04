@@ -4,6 +4,7 @@ import { requireSession } from '@/lib/guards';
 import { ApiError, errorResponse } from '@/lib/errors';
 import { writeAudit } from '@/lib/audit';
 import { createNotification } from '@/lib/notifications';
+import { enqueueJob } from '@/lib/jobs';
 import { loadProofForWrite } from '@/lib/proof-guards';
 
 type RouteCtx = { params: { proofId: string } };
@@ -39,10 +40,18 @@ export async function POST(_req: NextRequest, ctx: RouteCtx) {
 
     if (reasons.length > 0) throw new SealRequirementsError(reasons);
 
+    // Atomic with the SEAL transition: every sealed proof has an anchor
+    // job enqueued. Phase 5 anchor handler is a stub; Phase 7 replaces it
+    // with real OpenTimestamps submission. Wrapping in $transaction means
+    // a row that says SEALED implies a job exists (or both rolled back).
     const sealedAt = new Date();
-    const sealed = await prisma.proof.update({
-      where: { id: proof.id },
-      data: { status: 'SEALED', sealedAt },
+    const sealed = await prisma.$transaction(async (tx) => {
+      const updated = await tx.proof.update({
+        where: { id: proof.id },
+        data: { status: 'SEALED', sealedAt },
+      });
+      await enqueueJob('proof.anchor', { proofId: updated.id }, { tx });
+      return updated;
     });
 
     await writeAudit({

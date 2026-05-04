@@ -3,6 +3,7 @@ import { prisma } from '@/lib/db';
 import { requireSession } from '@/lib/guards';
 import { errorResponse, ValidationError } from '@/lib/errors';
 import { writeAudit } from '@/lib/audit';
+import { enqueueJob } from '@/lib/jobs';
 import { assertNotSealed, loadProofForRead, loadProofForWrite } from '@/lib/proof-guards';
 import { serializeFile } from '@/lib/proof-serializers';
 import { putObject } from '@/lib/storage';
@@ -84,6 +85,25 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       where: { id: fileRow.id },
       data: { storagePath },
     });
+
+    // Schedule the hash worker. Best-effort: failure to enqueue must not
+    // break the upload response. The worker itself flips hashStatus from
+    // PENDING → COMPLETE/FAILED; if no job ran we just stay PENDING and
+    // an ops sweep can re-enqueue.
+    try {
+      await enqueueJob('proof_file.hash', { fileId: finalRow.id });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Non-fatal — log via the audit as a sensitive op so it surfaces in
+      // dashboards rather than disappearing into stderr only.
+      await writeAudit({
+        actorUserId: user.id,
+        entityType: 'ProofFile',
+        entityId: finalRow.id,
+        action: 'job.failed',
+        meta: { type: 'proof_file.hash', stage: 'enqueue', error: message.slice(0, 1024) },
+      });
+    }
 
     await writeAudit({
       actorUserId: user.id,

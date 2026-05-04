@@ -5,6 +5,7 @@ import { requireSession } from '@/lib/guards';
 import { errorResponse, ForbiddenError, ValidationError } from '@/lib/errors';
 import { writeAudit } from '@/lib/audit';
 import { createNotification } from '@/lib/notifications';
+import { enqueueJob } from '@/lib/jobs';
 import { loadCaseForRead, caseIsOwner, caseIsSameOrg } from '@/lib/case-guards';
 import { serializePackageSummary } from '@/lib/case-serializers';
 
@@ -45,14 +46,26 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
     const json = await req.json().catch(() => ({}));
     const body = RequestBody.parse(json);
 
-    const pkg = await prisma.evidencePackage.create({
-      data: {
-        caseId: c.id,
-        packageType: body.packageType,
-        createdByUserId: user.id,
-        // status PENDING via schema default; storagePath stays null until
-        // the Phase 5 worker writes the zip.
-      },
+    // Atomic: writing the PENDING package row and enqueueing the build job
+    // share a transaction so "package row exists ↔ job is queued" can never
+    // be violated. Without this we could 202 the user, crash before
+    // enqueue, and leak a permanently-PENDING row that no worker claims.
+    const pkg = await prisma.$transaction(async (tx) => {
+      const created = await tx.evidencePackage.create({
+        data: {
+          caseId: c.id,
+          packageType: body.packageType,
+          createdByUserId: user.id,
+          // status PENDING via schema default; storagePath stays null until
+          // the Phase 5 worker writes the zip.
+        },
+      });
+      await enqueueJob(
+        'evidence_package.build',
+        { packageId: created.id },
+        { tx }
+      );
+      return created;
     });
 
     await writeAudit({
