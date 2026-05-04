@@ -102,13 +102,25 @@ type ClaimedJob = {
  */
 async function claimNextDue(): Promise<ClaimedJob | null> {
   return prisma.$transaction(async (tx) => {
+    // Two Postgres compatibility notes:
+    //   1. `status::text = 'PENDING'` instead of `'PENDING'::"JobStatus"`:
+    //      Prisma's $queryRaw can mangle the quoted enum-type cast; the
+    //      text cast is bulletproof and costs us nothing.
+    //   2. `(NOW() AT TIME ZONE 'UTC')::timestamp` for the time comparison:
+    //      Prisma stores DateTime as `timestamp(3)` (no tz) interpreted
+    //      as UTC. Postgres's NOW() returns `timestamptz`, and casting it
+    //      directly to `timestamp` strips the tz at the session-local
+    //      offset — so a NYC-tz session would compare runAfter against a
+    //      value 4 hours behind real UTC. AT TIME ZONE 'UTC' first
+    //      converts to UTC wall-clock, then the cast removes tz, giving
+    //      a comparable tz-naive UTC timestamp regardless of session tz.
     const rows = await tx.$queryRaw<
       Array<{ id: string; type: string; payload: unknown; attempts: number }>
     >`
       SELECT id, type, payload, attempts
       FROM "Job"
-      WHERE status = 'PENDING'::"JobStatus"
-        AND "runAfter" <= NOW()
+      WHERE status::text = 'PENDING'
+        AND "runAfter" <= (NOW() AT TIME ZONE 'UTC')::timestamp
       ORDER BY "runAfter" ASC
       LIMIT 1
       FOR UPDATE SKIP LOCKED
