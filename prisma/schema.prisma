@@ -137,15 +137,16 @@ model Proof {
   updatedAt      DateTime    @updatedAt
   sealedAt       DateTime?
 
-  owner            User                 @relation(fields: [ownerUserId], references: [id])
-  org              Organization?        @relation(fields: [orgId], references: [id])
-  files            ProofFile[]
-  attestation      ProofAttestation?
-  verifications    VerificationRecord[]
-  caseLinks        CaseProof[]
-  preservation     PreservationConfig?
-  anchor           ProofAnchor?
-  evidencePackages EvidencePackage[]
+  owner                   User                     @relation(fields: [ownerUserId], references: [id])
+  org                     Organization?            @relation(fields: [orgId], references: [id])
+  files                   ProofFile[]
+  attestation             ProofAttestation?
+  verifications           VerificationRecord[]
+  verificationChainCursor VerificationChainCursor?
+  caseLinks               CaseProof[]
+  preservation            PreservationConfig?
+  anchor                  ProofAnchor?
+  evidencePackages        EvidencePackage[]
 
   @@index([ownerUserId])
   @@index([orgId])
@@ -183,18 +184,25 @@ model ProofAttestation {
   proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
 }
 
+// Phase 6: VerificationRecord rows form a per-proof hash chain.
+// prevHash/entryHash are populated by lib/verification-chain.ts inside a
+// SELECT … FOR UPDATE on VerificationChainCursor (keyed by proofId).
+// Backfill: scripts/backfill-audit-chain.ts also stamps existing rows.
 model VerificationRecord {
   id               String   @id @default(cuid())
   proofId          String
   method           String
   result           String
   requesterContext Json     @default("{}")
+  prevHash         String?
+  entryHash        String
   createdAt        DateTime @default(now())
 
   proof Proof @relation(fields: [proofId], references: [id])
 
   @@index([proofId])
   @@index([createdAt(sort: Desc)])
+  @@index([proofId, createdAt(sort: Desc)])
 }
 
 model Notification {
@@ -267,6 +275,16 @@ model EvidencePackage {
   @@index([status])
 }
 
+// Phase 6: AuditLog rows form a tamper-evident hash chain.
+//   prevHash   = entryHash of the previous row (null for the genesis row).
+//   entryHash  = sha256(prevHash || actorUserId || entityType || entityId
+//                       || action || canonical(meta) || createdAt iso).
+//   signature  = HMAC-SHA-256(entryHash) under AUDIT_SIGNING_KEY (lib/audit-sig.ts).
+// Inserts go through lib/audit.ts → appendAudit, which serializes via
+// SELECT … FOR UPDATE on the global AuditChainCursor row. A BEFORE UPDATE
+// trigger (see migration) makes proof.hidden.revealed rows immutable for
+// 24 hours — declarative defense in depth; the application path never
+// updates audit rows anyway.
 model AuditLog {
   id          String   @id @default(cuid())
   actorUserId String?
@@ -274,12 +292,44 @@ model AuditLog {
   entityId    String
   action      String
   meta        Json     @default("{}")
+  prevHash    String?
+  entryHash   String
+  signature   String?
   createdAt   DateTime @default(now())
 
   actor User? @relation(fields: [actorUserId], references: [id])
 
   @@index([entityType, entityId, createdAt(sort: Desc)])
   @@index([actorUserId, createdAt(sort: Desc)])
+  @@index([createdAt])
+}
+
+// Single-row table (`id = 'global'`) acting as the lock target for the
+// audit hash chain. Append-audit transactions SELECT FOR UPDATE this row
+// to linearize concurrent writers. lastEntryHash mirrors the current chain
+// head for cheap lookup without scanning AuditLog.
+//
+// Single global cursor is the simplest correct design at current write
+// volume. When audit insert rate justifies sharding (~hundreds of rows/sec),
+// the swap is a per-shard cursor table + a hashing function from
+// (actorUserId, entityType) → shard.
+model AuditChainCursor {
+  id            String   @id @default("global")
+  lastEntryHash String?
+  updatedAt     DateTime @updatedAt
+}
+
+// Per-proof cursor for the verification record chain. Each proof gets its
+// own cursor row so heavy-traffic proofs serialize against themselves only,
+// not against unrelated verifies. lastEntryHash mirrors the per-proof chain
+// head. Created lazily on first verify; deleted when the proof is deleted
+// (cascade).
+model VerificationChainCursor {
+  proofId       String   @id
+  lastEntryHash String?
+  updatedAt     DateTime @updatedAt
+
+  proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
 }
 
 model PreservationConfig {
