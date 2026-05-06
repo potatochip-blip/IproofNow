@@ -1,10 +1,10 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { z } from 'zod';
-import { prisma } from '@/lib/db';
 import { getCurrentSession } from '@/lib/guards';
 import { errorResponse } from '@/lib/errors';
 import { writeAudit } from '@/lib/audit';
 import { loadProofForVerify } from '@/lib/proof-guards';
+import { appendVerificationRecord } from '@/lib/verification-chain';
 
 type RouteCtx = { params: { proofId: string } };
 
@@ -38,13 +38,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
 
     const proof = await loadProofForVerify(ctx.params.proofId, actor);
 
-    const record = await prisma.verificationRecord.create({
-      data: {
-        proofId: proof.id,
-        method: body.method,
-        result: 'verified',
-        requesterContext: (body.context ?? {}) as object,
-      },
+    // Phase 6: appendVerificationRecord chains via SELECT … FOR UPDATE on
+    // the per-proof VerificationChainCursor row. Phase 6 result is still
+    // always 'verified' — real hash comparison lands in a later phase.
+    const record = await appendVerificationRecord({
+      proofId: proof.id,
+      method: body.method,
+      result: 'verified',
+      requesterContext: body.context,
     });
 
     await writeAudit({
