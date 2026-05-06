@@ -65,6 +65,7 @@ app/
     cases/[caseId]/packages/route.ts            # POST request (atomic with job enqueue) + GET list
     packages/[packageId]/route.ts               # detail (downloadUrl when READY)
     proofs/[proofId]/export/route.ts            # JSON export (audited)
+    audit/verify/route.ts                       # ADMIN-only chain integrity check
 lib/
   db.ts                      # Prisma client singleton
   session.ts                 # generateSessionToken, createSession, validate (sliding refresh), invalidate*
@@ -83,11 +84,14 @@ lib/
   jobs/hash-file.ts          # proof_file.hash → fills ProofFile.fileHash + hashStatus
   jobs/build-package.ts      # evidence_package.build → zips manifest + files to S3, notifies owner
   jobs/anchor.ts             # proof.anchor → Phase 5 OpenTimestamps STUB (Phase 7 replaces)
-  rate-limit.ts              # in-memory token bucket (login throttle; Redis swap in prod)
+  rate-limit.ts              # RateLimiter interface + MemoryRateLimiter (Redis swap = lib/rate-limit-redis.ts)
   user-email.ts              # normalizeEmail() — single boundary for User.email writes/reads
   guards.ts                  # getCurrentSession, requireSession, requireRole(...roles)
   errors.ts                  # ApiError + typed subclasses + errorResponse() (incl. TooManyRequestsError)
-  audit.ts                   # writeAudit() — fire-and-log, never throws
+  audit.ts                   # appendAudit (chained) + writeAudit (passthrough, fire-and-log)
+  audit-sig.ts               # KMS-style HMAC-SHA-256 over entryHash; fail-fast on missing AUDIT_SIGNING_KEY
+  audit-chain.ts             # verifyAuditChain — walks createdAt asc, recomputes + checks signatures
+  verification-chain.ts      # appendVerificationRecord + verifyVerificationChain (per-proof chain)
   logger.ts                  # JSON line logger
 middleware.ts                # CORS for /api/* (allowlist + credentials)
 prisma/
@@ -98,18 +102,19 @@ tests/
   test-env.ts                # mocks next/headers cookies(); pins NODE_ENV=test
   cookie-jar.ts              # in-memory jar that quacks like cookies()
   helpers.ts                 # truncateAll, createTestUser/Org/Proof/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
-  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
 
 ---
 
-## Entity summary (15 models)
+## Entity summary (17 models)
 
 `User`, `Organization`, `Session`, `Proof`, `ProofFile`, `ProofAttestation`,
 `VerificationRecord`, `Notification`, `Case`, `CaseProof`, `EvidencePackage`,
-`AuditLog`, `PreservationConfig`, `Job`, `ProofAnchor`.
+`AuditLog`, `PreservationConfig`, `Job`, `ProofAnchor`, `AuditChainCursor`,
+`VerificationChainCursor`.
 
 Enums: `Role` (INDIVIDUAL|COMPANY|LAWYER|LAW_ENFORCEMENT|GOVERNMENT|ADMIN),
 `ProofStatus` (DRAFT|SEALED), `Visibility` (PRIVATE|PUBLIC|ORG),
@@ -128,6 +133,22 @@ populated).
 Phase 5 writes status='STUB' rows from the anchor stub worker — Phase 7
 overwrites otsProof with a real OpenTimestamps receipt and flips
 status='CONFIRMED').
+
+**Phase 6 schema additions**:
+- `AuditLog.prevHash String?`, `AuditLog.entryHash String`, `AuditLog.signature String?` —
+  tamper-evident hash chain. `entryHash = sha256(prevHash || actorUserId ||
+  entityType || entityId || action || canonical(meta) || createdAt iso)`.
+  `signature = HMAC-SHA-256(entryHash)` under `AUDIT_SIGNING_KEY`.
+- `VerificationRecord.prevHash String?`, `VerificationRecord.entryHash String` —
+  same chain idea, scoped per-proof rather than global.
+- `AuditChainCursor` (single row, `id='global'`) — the lock target that
+  serializes audit chain inserts via `SELECT … FOR UPDATE`. `lastEntryHash`
+  mirrors the chain head so appends don't re-scan AuditLog.
+- `VerificationChainCursor` (one row per proof, `proofId @id`) — per-proof
+  lock target. Heavy-traffic proofs serialize against themselves only.
+- BEFORE UPDATE trigger on `AuditLog`: rejects modifications to rows where
+  `action='proof.hidden.revealed'` AND `now() - createdAt < 24h`. Defense
+  in depth — the application path never updates audit rows.
 
 Every FK is indexed. Common query columns indexed: `Proof.ownerUserId`,
 `Proof.orgId`, `(Proof.ownerUserId,status)`, `(Proof.orgId,status)`,
@@ -459,6 +480,40 @@ Three handlers ship in Phase 5, registered via dynamic import inside
 
 ---
 
+## API contracts (Phase 6 — Chain hardening + audit immutability + signed entries)
+
+### Endpoint
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/audit/verify` | ADMIN | `?since=ISO8601` optional. 200 → `{ ok: true, count }` or `{ ok: false, brokenAt, reason, expected, actual }`. `reason ∈ {'hash_mismatch','signature_mismatch','broken_link'}`. The verifier seeds `prevHash` from the row immediately before `since` so truncation at the boundary is detected. Self-emits `audit.chain.verified`. 403 to non-admins. |
+
+### Audit chain invariants
+
+- **Hash composition**: `entryHash = sha256(prevHash || actorUserId || entityType || entityId || action || canonicalJson(meta) || createdAt iso)`. Fields are NUL-delimited so distinct values can't collide via concatenation. `canonicalJson` does recursive sorted-key encoding so meta-key ordering doesn't change the hash.
+- **Serialization**: every `appendAudit` opens a transaction, takes `SELECT … FOR UPDATE` on `AuditChainCursor` (`id='global'`), reads the chain head from `lastEntryHash`, inserts the new row, updates the cursor. Concurrent appends are serialized by Postgres row locks.
+- **Signature**: HMAC-SHA-256 over `entryHash` under `AUDIT_SIGNING_KEY` (32 bytes). Stored as `signature String?` — null tolerated only for backfilled pre-Phase-6 rows; new rows always populate. `lib/audit-sig.ts` is the swap point for a real KMS later.
+- **Why a single global cursor instead of sharding**: at current write volume (handfuls of audit rows per request, low-tens of req/s), a single `SELECT FOR UPDATE` is the simplest correct design and won't be the bottleneck. When audit insert rate justifies sharding (~hundreds/sec), the swap is a per-shard cursor table + a hashing function `(actorUserId, entityType) → shard`. **Per-proof verification chains already shard naturally** — they were sharded from day one because individual proofs vary wildly in verify volume.
+- **`writeAudit` is the public passthrough**: every Phase 1–5 emit site keeps using it. Failures don't propagate (still fire-and-log). Code that needs the throw-on-failure semantics calls `appendAudit` directly.
+
+### Verification record chain invariants
+
+- **Per-proof, never global**: each proof has its own `VerificationChainCursor` row keyed by `proofId`. A heavy-traffic public proof being verified thousands of times serializes against itself only.
+- **Hash composition**: `entryHash = sha256(prevHash || proofId || method || result || canonicalJson(requesterContext) || createdAt iso)`. Same NUL-delimited / canonical-JSON rules as audit.
+- **No HMAC signature**: the chain itself + the paired `proof.verified` audit row (which references the verification record id) provides tamper detection. Add HMAC if a future threat model justifies the extra storage.
+
+### Audit-row immutability
+
+- **Application path never updates AuditLog rows.** Every Phase 1–6 emit site is INSERT-only.
+- **DB trigger backstop**: BEFORE UPDATE on `AuditLog` raises a `check_violation` when `OLD.action = 'proof.hidden.revealed'` AND `(now() - OLD.createdAt) < 24h`. Defense in depth — protects against operator error / future bugs / direct SQL changes inside the 24h window where a fraudulent reveal cover-up would be most likely.
+- **Outside the 24h window** updates are allowed (e.g. legal hold / forensic export workflows). The chain's hash check still surfaces any tampering on the next `audit.chain.verified` call regardless of when it happened.
+
+### Backfill (`scripts/backfill-audit-chain.ts`)
+
+One-shot. Walks existing `AuditLog` rows in `(createdAt asc, id asc)` order, computes prevHash/entryHash/signature, writes them back. Same for `VerificationRecord` (per-proof). Idempotent — rows already stamped (`entryHash <> ''`) are skipped. Refuses to run in `NODE_ENV=production` without `--allow-prod`. Recent `proof.hidden.revealed` rows go through `SET LOCAL session_replication_role = 'replica'` to bypass the immutability trigger for the backfill UPDATE only.
+
+---
+
 ## Notification types
 
 Closed enum — frontend branches on `type` to pick icons and route targets,
@@ -586,6 +641,15 @@ job retries that aren't terminal (intermediate `RUNNING → PENDING` cycles),
 successful job COMPLETE transitions (the handlers' state changes — package
 ready, file hashed, proof anchored — are observable through their own
 domain rows / notifications).
+
+**Phase 6 audited actions**:
+
+- `audit.chain.verified` — **operator action** on GET /api/audit/verify. ADMIN-only. `entityType='AuditLog'`, `entityId='chain'`, `meta.ok`, `meta.count`, `meta.since?` (when bounded), `meta.brokenAt`/`meta.reason` on failure. The verify endpoint's own audit row chains forward, so a clean verify is the strongest possible attestation: every prior row's hash + signature checked AND the chain head was still consistent at the moment of verification.
+
+Explicitly **not** audited in Phase 6: chain-internal recomputes (the
+verifier doesn't audit per-row checks, only the verify call as a whole),
+backfill script execution (it's a one-shot ops tool — execution is logged
+to stdout, not the chain).
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -718,5 +782,29 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       model. `NotificationType += 'evidence_package_ready'`. New audit
       actions: `proof.exported`, `job.failed`, plus rate-limited login
       audited via existing `auth.login.failure` with `meta.reason='rate_limited'`.
-- [ ] Phase 6+ — Verification chain hardening, audit immutability,
-      KMS-style signed audit entries.
+- [x] **Phase 6 — Verification chain hardening + audit immutability +
+      KMS-style signed audit entries**: AuditLog rows are now linked into
+      a tamper-evident hash chain via `lib/audit.ts → appendAudit` (every
+      Phase 1–5 emit site keeps using `writeAudit` and gains chaining for
+      free through the passthrough). `prevHash`/`entryHash` columns +
+      `signature String?` (HMAC-SHA-256 under `AUDIT_SIGNING_KEY`). The
+      chain serializes through `AuditChainCursor` (`SELECT … FOR UPDATE`
+      on a single global row); per-proof verification chains use their
+      own `VerificationChainCursor` keyed by proofId so heavy-traffic
+      proofs serialize against themselves only. New endpoint
+      `GET /api/audit/verify` (ADMIN-only) walks the chain, recomputes
+      every entryHash, checks signatures, and self-emits
+      `audit.chain.verified`. `lib/audit-sig.ts` is the KMS shim — swap
+      this one file for a real KMS later, no call-site rewrites. BEFORE
+      UPDATE trigger on AuditLog rejects edits to `proof.hidden.revealed`
+      rows < 24h old (declarative defense in depth). Hardening: strict
+      CSP + nosniff + Referrer-Policy headers in `next.config.mjs`;
+      `RateLimiter` interface extracted in `lib/rate-limit.ts` so the
+      Redis swap is a new file, not call-site changes; `cookies.ts` TODO
+      flagged for the future share-grant privilege-rotation hook.
+      Backfill: `scripts/backfill-audit-chain.ts` (idempotent, refuses
+      prod without `--allow-prod`). New audit actions:
+      `audit.chain.verified`. New env var: `AUDIT_SIGNING_KEY` (64 hex,
+      module-load fail-fast outside `NODE_ENV=test`).
+- [ ] Phase 7+ — Real OpenTimestamps integration replacing the Phase 5
+      anchor stub (calendar-server submission, async receipt, verify).
