@@ -24,16 +24,24 @@ export function db(): PrismaClient {
   return prisma;
 }
 
-/** Wipe all rows between tests. Order matters: child tables first. */
+/** Wipe all rows between tests. Order matters: child tables first.
+ *  AuditChainCursor stays — it's a single-row global lock target that the
+ *  Phase 6 chain helpers SELECT FOR UPDATE; we reset its head hash instead.
+ *  VerificationChainCursor cascades when its Proof is dropped.
+ */
 export async function truncateAll(): Promise<void> {
   const p = db();
   await p.$executeRawUnsafe(`
     TRUNCATE TABLE
-      "AuditLog","VerificationRecord","CaseProof","EvidencePackage",
-      "ProofAttestation","ProofFile","PreservationConfig","ProofAnchor",
-      "Notification","Job","Proof","Case","Session","Organization","User"
+      "AuditLog","VerificationRecord","VerificationChainCursor","CaseProof",
+      "EvidencePackage","ProofAttestation","ProofFile","PreservationConfig",
+      "ProofAnchor","Notification","Job","Proof","Case","Session",
+      "Organization","User"
     RESTART IDENTITY CASCADE;
   `);
+  await p.$executeRawUnsafe(
+    `UPDATE "AuditChainCursor" SET "lastEntryHash" = NULL WHERE "id" = 'global';`
+  );
 }
 
 export async function createTestUser(opts: {
@@ -160,12 +168,13 @@ export async function createTestVerification(
   proofId: string,
   overrides: Partial<{ method: string; result: string }> = {}
 ): Promise<VerificationRecord> {
-  return db().verificationRecord.create({
-    data: {
-      proofId,
-      method: overrides.method ?? 'hash',
-      result: overrides.result ?? 'verified',
-    },
+  // Phase 6: route inserts through the per-proof chain helper so tests
+  // exercise the same code path as production.
+  const { appendVerificationRecord } = await import('@/lib/verification-chain');
+  return appendVerificationRecord({
+    proofId,
+    method: overrides.method ?? 'hash',
+    result: overrides.result ?? 'verified',
   });
 }
 
