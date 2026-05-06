@@ -14,6 +14,18 @@ function isProd(): boolean {
  *     /api/* same-origin → cookies attach without CORS dance.
  *   - prod: sameSite=none, secure=true. Cross-origin (api.* + app.*) requires
  *     SameSite=None + Secure for browsers to attach the cookie at all.
+ *
+ * Phase 6 note — privilege rotation:
+ *   No code path in Phases 1–6 changes a session's effective role mid-
+ *   session. requireRole() throws ForbiddenError on mismatch but never
+ *   mutates the user. There's no "elevate to admin" or "switch role"
+ *   surface. So a session-cookie rotation step (rotateSessionCookieOn-
+ *   PrivilegeChange) would have nothing to react to.
+ *
+ *   TODO(phase-share): when the share-grant flow lands and a non-owner
+ *   gains access to a Case via an explicit grant, the new effective
+ *   capability set means we should rotate the session token to invalidate
+ *   any pre-grant copies. Wire it into the share-grant POST handler.
  */
 export function setSessionCookie(token: string, expiresAt: Date): void {
   cookies().set({
