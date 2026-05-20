@@ -5,6 +5,7 @@ import { errorResponse } from '@/lib/errors';
 import { writeAudit } from '@/lib/audit';
 import { loadProofForVerify } from '@/lib/proof-guards';
 import { appendVerificationRecord } from '@/lib/verification-chain';
+import { evaluateProof } from '@/lib/proof-verification';
 
 type RouteCtx = { params: { proofId: string } };
 
@@ -23,10 +24,12 @@ const VerifyBody = z
  *   - PRIVATE / ORG visibility   → session + owner or same-org-non-private.
  *   - Hidden vault               → 404 to everyone except owner (invariant).
  *
- * Phase 3 always returns result='verified' if access resolves — real hash
- * comparison is Phase 6. The VerificationRecord row is created either way
- * so future phases can rewrite the pass/fail logic without touching the
- * client contract.
+ * Phase 8: the result is real. `evaluateProof` recomputes the proof's
+ * content digest and compares it to ProofAnchor.contentHash, yielding
+ * VERIFIED / TAMPERED / NOT_FOUND / INDETERMINATE plus a strength tier.
+ * The VerificationRecord is appended to the per-proof hash chain either
+ * way, and `proof.verified` is always audited — including for anonymous
+ * verifies of PUBLIC proofs, so a TAMPERED finding is never silent.
  */
 export async function POST(req: NextRequest, ctx: RouteCtx) {
   try {
@@ -38,13 +41,13 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
 
     const proof = await loadProofForVerify(ctx.params.proofId, actor);
 
-    // Phase 6: appendVerificationRecord chains via SELECT … FOR UPDATE on
-    // the per-proof VerificationChainCursor row. Phase 6 result is still
-    // always 'verified' — real hash comparison lands in a later phase.
+    const { result, tier } = await evaluateProof(proof);
+
     const record = await appendVerificationRecord({
       proofId: proof.id,
       method: body.method,
-      result: 'verified',
+      result,
+      tier,
       requesterContext: body.context,
     });
 
@@ -55,7 +58,8 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       action: 'proof.verified',
       meta: {
         method: body.method,
-        result: 'verified',
+        result,
+        tier,
         visibility: proof.visibility,
         anonymous: actor === null,
       },
@@ -65,6 +69,7 @@ export async function POST(req: NextRequest, ctx: RouteCtx) {
       verificationId: record.id,
       proofId: proof.id,
       result: record.result,
+      tier: record.tier,
       verifiedAt: record.createdAt.toISOString(),
     });
   } catch (err) {
