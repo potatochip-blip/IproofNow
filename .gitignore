@@ -16,3 +16,6 @@ minio-data
 .DS_Store
 .vscode
 .idea
+
+# Claude Code local worktrees / agent state — never part of the repo.
+.claude
