@@ -8,12 +8,27 @@ import { writeAudit } from './audit';
 export type JobType =
   | 'evidence_package.build'
   | 'proof_file.hash'
-  | 'proof.anchor';
+  | 'proof.anchor'
+  | 'proof.anchor.upgrade';
 
 export type JobHandler<P = unknown> = (
   payload: P,
   ctx: { jobId: string; attempts: number }
 ) => Promise<void>;
+
+/**
+ * A handler throwing TerminalJobError tells the runner to skip the
+ * remaining retry budget and fail the job immediately (one `job.failed`
+ * audit, no backoff). Use it for "this will never succeed" outcomes —
+ * e.g. an OTS upgrade that hasn't confirmed within the 7-day cap. An
+ * ordinary Error keeps the normal 3-attempt exponential-backoff retry.
+ */
+export class TerminalJobError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TerminalJobError';
+  }
+}
 
 export type EnqueueOptions = {
   /** Delay first run; defaults to now. */
@@ -54,16 +69,22 @@ type Prisma_TxClient = Pick<PrismaClient, 'job'>;
 // lets each handler module pull in its own deps (archiver, S3 GET, etc.)
 // without making the runner pay for them on every request.
 async function loadHandlers(): Promise<Record<string, JobHandler>> {
-  const [{ handleHashFile }, { handleBuildPackage }, { handleAnchor }] =
-    await Promise.all([
-      import('./jobs/hash-file'),
-      import('./jobs/build-package'),
-      import('./jobs/anchor'),
-    ]);
+  const [
+    { handleHashFile },
+    { handleBuildPackage },
+    { handleAnchor },
+    { handleAnchorUpgrade },
+  ] = await Promise.all([
+    import('./jobs/hash-file'),
+    import('./jobs/build-package'),
+    import('./jobs/anchor'),
+    import('./jobs/anchor-upgrade'),
+  ]);
   return {
     'proof_file.hash': handleHashFile as JobHandler,
     'evidence_package.build': handleBuildPackage as JobHandler,
     'proof.anchor': handleAnchor as JobHandler,
+    'proof.anchor.upgrade': handleAnchorUpgrade as JobHandler,
   };
 }
 
@@ -151,7 +172,9 @@ async function markRetryOrFailed(
   const message = err instanceof Error ? err.message : String(err);
   const truncated = message.slice(0, 1024);
 
-  if (job.attempts >= MAX_ATTEMPTS) {
+  // TerminalJobError short-circuits the retry budget — the handler has
+  // declared this outcome unrecoverable.
+  if (err instanceof TerminalJobError || job.attempts >= MAX_ATTEMPTS) {
     await prisma.job.update({
       where: { id: job.id },
       data: {
