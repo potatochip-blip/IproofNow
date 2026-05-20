@@ -1,14 +1,34 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { drainJobs, enqueueJob, runDueJobs } from '@/lib/jobs';
 import { createTestUser, db, truncateAll } from './helpers';
 import { resetCookieJar } from './cookie-jar';
+import { startOtsStub, type OtsStub } from './ots-stub';
+
+// The proof.anchor handler is used here as a representative real handler.
+// Phase 7 made it talk to OTS calendars, so the runner tests point it at
+// the in-process stub.
+let stub: OtsStub;
+let prevCalendars: string | undefined;
+let prevExplorer: string | undefined;
+
+beforeAll(async () => {
+  stub = await startOtsStub();
+  prevCalendars = process.env.OTS_CALENDAR_URLS;
+  prevExplorer = process.env.BITCOIN_EXPLORER_URL;
+  process.env.OTS_CALENDAR_URLS = stub.url;
+  process.env.BITCOIN_EXPLORER_URL = stub.url;
+});
 
 beforeEach(async () => {
   await truncateAll();
   resetCookieJar();
+  stub.setMode('pending');
 });
 
 afterAll(async () => {
+  await stub.close();
+  process.env.OTS_CALENDAR_URLS = prevCalendars;
+  process.env.BITCOIN_EXPLORER_URL = prevExplorer;
   await db().$disconnect();
 });
 
@@ -19,7 +39,7 @@ describe('lib/jobs runner', () => {
   });
 
   it('claims a due job exactly once and marks it COMPLETE on handler success', async () => {
-    // anchor stub is the simplest real handler — proofId-based, no S3.
+    // proof.anchor as a representative handler — submits to the OTS stub.
     const { user } = await createTestUser();
     const proof = await db().proof.create({
       data: {
@@ -37,9 +57,9 @@ describe('lib/jobs runner', () => {
     const anchor = await db().proofAnchor.findUnique({
       where: { proofId: proof.id },
     });
-    expect(anchor?.status).toBe('STUB');
+    expect(anchor?.status).toBe('PENDING');
 
-    // Idempotent — second drain finds nothing.
+    // The follow-up upgrade job is scheduled ~1h out, so nothing is due now.
     expect(await runDueJobs()).toBeNull();
   });
 

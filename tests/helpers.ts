@@ -1,16 +1,22 @@
+import { createHash } from 'node:crypto';
 import {
   PrismaClient,
+  type AnchorStatus,
   type Case,
   type CaseProof,
   type EvidencePackage,
+  type HashStatus,
   type Notification,
   type Organization,
   type PackageStatus,
   type Proof,
+  type ProofAnchor,
+  type ProofFile,
   type Role,
   type User,
   type VerificationRecord,
 } from '@prisma/client';
+import { buildStoredOtsProof } from './ots-stub';
 import { hashPassword } from '@/lib/password';
 import { createSession, generateSessionToken } from '@/lib/session';
 import { seedCookie } from './cookie-jar';
@@ -175,6 +181,70 @@ export async function createTestVerification(
     proofId,
     method: overrides.method ?? 'hash',
     result: overrides.result ?? 'verified',
+  });
+}
+
+/** Create a ProofFile row directly (no S3 upload). */
+export async function createTestProofFile(
+  proofId: string,
+  overrides: Partial<{
+    originalName: string;
+    mimeType: string;
+    size: number;
+    storagePath: string;
+    fileHash: string | null;
+    hashStatus: HashStatus;
+  }> = {}
+): Promise<ProofFile> {
+  return db().proofFile.create({
+    data: {
+      proofId,
+      originalName: overrides.originalName ?? 'evidence.pdf',
+      mimeType: overrides.mimeType ?? 'application/pdf',
+      size: overrides.size ?? 1024,
+      storagePath: overrides.storagePath ?? `proofs/${proofId}/evidence.pdf`,
+      fileHash:
+        overrides.fileHash !== undefined
+          ? overrides.fileHash
+          : createHash('sha256').update(`${proofId}:file`).digest('hex'),
+      hashStatus: overrides.hashStatus ?? 'COMPLETE',
+    },
+  });
+}
+
+/** Create a ProofAnchor row directly with a valid OTS proof. */
+export async function createTestAnchor(
+  proofId: string,
+  overrides: Partial<{
+    status: AnchorStatus;
+    contentHash: Buffer;
+    otsProof: Buffer;
+    bitcoinBlockHeight: number | null;
+    bitcoinBlockHash: string | null;
+    confirmedAt: Date | null;
+  }> = {}
+): Promise<ProofAnchor> {
+  const status = overrides.status ?? 'PENDING';
+  const contentHash =
+    overrides.contentHash ?? createHash('sha256').update(proofId).digest();
+  const confirmed = status === 'CONFIRMED';
+  const otsProof =
+    overrides.otsProof ??
+    buildStoredOtsProof(contentHash, {
+      confirmed,
+      height: overrides.bitcoinBlockHeight ?? undefined,
+    });
+  return db().proofAnchor.create({
+    data: {
+      proofId,
+      status,
+      contentHash,
+      otsProof,
+      bitcoinBlockHeight:
+        overrides.bitcoinBlockHeight ?? (confirmed ? 800_000 : null),
+      bitcoinBlockHash: overrides.bitcoinBlockHash ?? null,
+      confirmedAt: overrides.confirmedAt ?? (confirmed ? new Date() : null),
+    },
   });
 }
 

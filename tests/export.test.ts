@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { NextRequest } from 'next/server';
 import { GET as exportProof } from '@/app/api/proofs/[proofId]/export/route';
 import {
+  createTestAnchor,
   createTestProof,
   createTestUser,
   db,
@@ -72,6 +73,31 @@ describe('GET /api/proofs/[proofId]/export', () => {
     expect(typeof body.anchor.anchoredAt).toBe('string');
     // base64('hello-anchor') = aGVsbG8tYW5jaG9y
     expect(body.anchor.otsProof).toBe('aGVsbG8tYW5jaG9y');
+    // Phase 7 fields — null on a legacy STUB row, plus the verify link.
+    expect(body.anchor.contentHash).toBeNull();
+    expect(body.anchor.confirmedAt).toBeNull();
+    expect(body.anchor.bitcoinBlockHeight).toBeNull();
+    expect(body.anchor.verifyUrl).toBe(`/api/proofs/${proof.id}/anchor/verify`);
+  });
+
+  it('owner: a CONFIRMED anchor exports the Bitcoin block detail + contentHash', async () => {
+    const { user } = await createTestUser();
+    await loginAs(user.id);
+    const proof = await createTestProof(user.id);
+    await createTestAnchor(proof.id, {
+      status: 'CONFIRMED',
+      bitcoinBlockHeight: 812_345,
+      bitcoinBlockHash: 'f'.repeat(64),
+    });
+
+    const res = await exportProof(req(proof.id), ctx(proof.id));
+    const body = await res.json();
+    expect(body.anchor.status).toBe('CONFIRMED');
+    expect(body.anchor.bitcoinBlockHeight).toBe(812_345);
+    expect(body.anchor.bitcoinBlockHash).toBe('f'.repeat(64));
+    expect(body.anchor.contentHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(typeof body.anchor.confirmedAt).toBe('string');
+    expect(typeof body.anchor.otsProof).toBe('string');
   });
 
   it('hidden-vault proof: non-owner → 404 (existence not leaked)', async () => {
