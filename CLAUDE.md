@@ -65,6 +65,7 @@ app/
     cases/[caseId]/packages/route.ts            # POST request (atomic with job enqueue) + GET list
     packages/[packageId]/route.ts               # detail (downloadUrl when READY)
     proofs/[proofId]/export/route.ts            # JSON export (audited)
+    proofs/[proofId]/anchor/verify/route.ts     # re-check OTS anchor (audited)
     audit/verify/route.ts                       # ADMIN-only chain integrity check
 lib/
   db.ts                      # Prisma client singleton
@@ -80,10 +81,14 @@ lib/
   case-search.ts             # q+filter Prisma where composer for Case
   notifications.ts           # createNotification + NotificationType closed union
   storage.ts                 # S3Client singleton + putObject + getObjectStream + presigned GET (MinIO via forcePathStyle)
-  jobs.ts                    # enqueueJob/runDueJobs/drainJobs (FOR UPDATE SKIP LOCKED + retry backoff)
+  jobs.ts                    # enqueueJob/runDueJobs/drainJobs (SKIP LOCKED + retry backoff + TerminalJobError)
   jobs/hash-file.ts          # proof_file.hash → fills ProofFile.fileHash + hashStatus
   jobs/build-package.ts      # evidence_package.build → zips manifest + files to S3, notifies owner
-  jobs/anchor.ts             # proof.anchor → Phase 5 OpenTimestamps STUB (Phase 7 replaces)
+  jobs/anchor.ts             # proof.anchor → OTS submit: digest → calendars → PENDING anchor
+  jobs/anchor-upgrade.ts     # proof.anchor.upgrade → poll calendars → CONFIRMED / re-enqueue / FAILED
+  ots/proof-digest.ts        # computeProofDigest — sha256(audit chain + file hashes + attestation)
+  ots/client.ts              # ONLY importer of `opentimestamps`: submit/upgrade/parse, bounded timeouts
+  ots/bitcoin-explorer.ts    # read-only Esplora block lookup (anchor/verify lite check)
   rate-limit.ts              # RateLimiter interface + MemoryRateLimiter (Redis swap = lib/rate-limit-redis.ts)
   user-email.ts              # normalizeEmail() — single boundary for User.email writes/reads
   guards.ts                  # getCurrentSession, requireSession, requireRole(...roles)
@@ -95,14 +100,15 @@ lib/
   logger.ts                  # JSON line logger
 middleware.ts                # CORS for /api/* (allowlist + credentials)
 prisma/
-  schema.prisma              # 15 entities + 7 enums
+  schema.prisma              # 17 models + 8 enums
   seed.ts                    # 6 users (one per role); refuses to run in production
 tests/
   global-setup.ts            # prisma db push --force-reset against *_test DB
   test-env.ts                # mocks next/headers cookies(); pins NODE_ENV=test
   cookie-jar.ts              # in-memory jar that quacks like cookies()
-  helpers.ts                 # truncateAll, createTestUser/Org/Proof/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
-  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts
+  helpers.ts                 # truncateAll, createTestUser/Org/Proof/ProofFile/Anchor/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
+  ots-stub.ts                # in-process stub OTS calendar + Bitcoin explorer for tests
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts anchor.test.ts anchor-upgrade.test.ts anchor-verify.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
@@ -120,7 +126,8 @@ Enums: `Role` (INDIVIDUAL|COMPANY|LAWYER|LAW_ENFORCEMENT|GOVERNMENT|ADMIN),
 `ProofStatus` (DRAFT|SEALED), `Visibility` (PRIVATE|PUBLIC|ORG),
 `PackageStatus` (PENDING|READY|FAILED), `SubscriptionTier`
 (FREE|PRO|BUSINESS|ENTERPRISE), `HashStatus` (PENDING|COMPLETE|FAILED),
-`JobStatus` (PENDING|RUNNING|COMPLETE|FAILED).
+`JobStatus` (PENDING|RUNNING|COMPLETE|FAILED),
+`AnchorStatus` (STUB|PENDING|CONFIRMED|FAILED).
 
 **Phase 2 schema additions**: `Proof.roleContext String?` (freeform role
 context on draft creation); `ProofFile.hashStatus HashStatus @default(PENDING)`
@@ -149,6 +156,19 @@ status='CONFIRMED').
 - BEFORE UPDATE trigger on `AuditLog`: rejects modifications to rows where
   `action='proof.hidden.revealed'` AND `now() - createdAt < 24h`. Defense
   in depth — the application path never updates audit rows.
+
+**Phase 7 schema additions** (`ProofAnchor` evolution):
+- `status` is now the `AnchorStatus` enum (was a free `String`). The Phase 7
+  migration converts the column via `USING status::"AnchorStatus"`;
+  `scripts/backfill-anchor-status.ts` is the documented gate — run it first
+  to assert no legacy row holds a value outside the enum (Phase 5 only ever
+  wrote `'STUB'`, so it's a no-op in practice).
+- `contentHash Bytes?` — the 32-byte sha256 digest actually submitted to the
+  OTS calendars. Stored so `anchor/verify` (and the Phase 8 tamper check)
+  needn't deserialize `otsProof`. Nullable only for legacy STUB rows.
+- `bitcoinBlockHeight Int?`, `bitcoinBlockHash String?`, `confirmedAt
+  DateTime?`, `upgradedAt DateTime?` — populated on the CONFIRMED transition
+  from the Bitcoin attestation + block explorer.
 
 Every FK is indexed. Common query columns indexed: `Proof.ownerUserId`,
 `Proof.orgId`, `(Proof.ownerUserId,status)`, `(Proof.orgId,status)`,
@@ -423,6 +443,13 @@ FAILED). Terminal FAILED writes an internal `job.failed` audit row with
 the truncated error so ops can spot persistently-broken handlers without
 scraping logs.
 
+**`TerminalJobError` (Phase 7)**: a handler that throws `TerminalJobError`
+(exported from `lib/jobs.ts`) tells the runner to skip the remaining retry
+budget and fail the job immediately — one `job.failed` audit, no backoff.
+Use it for outcomes the handler knows are unrecoverable (e.g. an OTS
+upgrade still unconfirmed after the 7-day cap). An ordinary `Error` keeps
+the standard 3-attempt retry.
+
 **Critical Postgres footgun**: the SKIP-LOCKED claim compares
 `"runAfter"` against `(NOW() AT TIME ZONE 'UTC')::timestamp`, NOT plain
 NOW(). Prisma stores `DateTime` as `timestamp(3)` (no tz) interpreted as
@@ -443,8 +470,8 @@ endpoint, or a real queue once load demands it. The handler interface
 
 ### Job handler registry
 
-Three handlers ship in Phase 5, registered via dynamic import inside
-`lib/jobs.ts → loadHandlers()`:
+Handlers are registered via dynamic import inside `lib/jobs.ts →
+loadHandlers()`:
 
 - `proof_file.hash` (`lib/jobs/hash-file.ts`) — streams the S3 object
   through `createHash('sha256')` rather than buffering, writes back
@@ -457,10 +484,21 @@ Three handlers ship in Phase 5, registered via dynamic import inside
   Missing package id is a terminal no-op. Mid-zip throws retry; only the
   3rd (terminal) attempt flips the EvidencePackage row to FAILED so
   transient S3 hiccups don't toggle READY/FAILED on every retry.
-- `proof.anchor` (`lib/jobs/anchor.ts`) — Phase 5 stub. Writes a
-  `ProofAnchor` row with `status='STUB'` and a deterministic pseudo-
-  otsProof = `sha256(proofId)`. Idempotent via upsert on the unique
-  proofId. Phase 7 replaces this with real OpenTimestamps submission.
+- `proof.anchor` (`lib/jobs/anchor.ts`) — Phase 7 OTS submit. Computes the
+  proof content digest, submits it to the OTS calendars, writes a
+  `ProofAnchor` at `status='PENDING'` with `contentHash` recorded, and
+  enqueues the first `proof.anchor.upgrade` at +1h (atomically with the
+  anchor row). If file hashes aren't COMPLETE yet it self-re-enqueues at
+  +60s (cap 15 waits → terminal). Idempotent — a proof already PENDING or
+  CONFIRMED is skipped; a legacy STUB / prior FAILED row is re-anchored.
+- `proof.anchor.upgrade` (`lib/jobs/anchor-upgrade.ts`) — Phase 7 OTS
+  upgrade poll. Confirmed → full receipt + `status='CONFIRMED'` + Bitcoin
+  block height/hash. Not ready → re-enqueue on the backoff schedule
+  (`[6,24,24,24,24,24,24]` h; ~6.3 days total inside a 7-day ceiling).
+  Cap exceeded → `ProofAnchor.status='FAILED'` + `TerminalJobError`.
+
+See "API contracts (Phase 7)" below for the OTS architecture, the digest
+composition, and why calendar round-trips are deliberately not audited.
 
 ### Hardening
 
@@ -511,6 +549,44 @@ Three handlers ship in Phase 5, registered via dynamic import inside
 ### Backfill (`scripts/backfill-audit-chain.ts`)
 
 One-shot. Walks existing `AuditLog` rows in `(createdAt asc, id asc)` order, computes prevHash/entryHash/signature, writes them back. Same for `VerificationRecord` (per-proof). Idempotent — rows already stamped (`entryHash <> ''`) are skipped. Refuses to run in `NODE_ENV=production` without `--allow-prod`. Recent `proof.hidden.revealed` rows go through `SET LOCAL session_replication_role = 'replica'` to bypass the immutability trigger for the backfill UPDATE only.
+
+---
+
+## API contracts (Phase 7 — Real OpenTimestamps anchoring)
+
+### Endpoint
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/proofs/:proofId/anchor/verify` | required | Same access ladder as `loadProofForRead` (owner / same-org-non-PRIVATE / PUBLIC; hidden-vault → 404). Re-checks the OTS anchor *without trusting the DB*: parses the stored receipt, and for CONFIRMED reads the Bitcoin attestation + confirms the block via the explorer; for PENDING re-queries the calendars live (no DB write). 200 → `{ anchored, status, contentHashMatches, confirmed, bitcoin: { height, blockHash, time } \| null, checkedAt }`. No anchor / legacy STUB → `{ anchored: false }`. Audits `proof.anchor.verified`. |
+
+`GET /api/proofs/:proofId/export` gained anchor fields: `status`, `confirmedAt`, `contentHash` (hex), `bitcoinBlockHeight`, `bitcoinBlockHash`, and `verifyUrl` (the route above). `otsProof` stays base64.
+
+### OTS architecture
+
+- **Library**: the official `opentimestamps` npm package, used only inside `lib/ots/client.ts` — the single import site, so a future swap (or self-hosted calendar) is a one-file rewrite plus `types/opentimestamps.d.ts`. The package ships a broken `main`; `next.config.mjs` marks it (and `@node-rs/argon2`) `serverComponentsExternalPackages`, and `vitest.config.ts` aliases the bare specifier to `index.js`.
+- **Two-phase flow**: `proof.anchor` submits the digest (→ `PENDING`); `proof.anchor.upgrade` polls the calendars on a backoff schedule until a Bitcoin block attestation appears (→ `CONFIRMED`) or the ~7-day cap is hit (→ `FAILED`).
+- **Content digest** (`lib/ots/proof-digest.ts`): `sha256` over NUL-delimited sections — every `AuditLog.entryHash` for the proof (ordered), every `ProofFile.fileHash` (ordered), and canonical JSON of the `ProofAttestation`. Folding in the audit *entryHashes* means the anchor transitively commits to the proof's whole Phase-6 audit chain. Stored verbatim in `ProofAnchor.contentHash`.
+- **Timeouts**: per-calendar bound of 15s (5s connect + 10s body intent — the library exposes only one coarse socket timeout, so we enforce the sum), applied both on the `RemoteCalendar` and as a `Promise` race. Calendars are fanned out in parallel; submit succeeds if ≥1 accepts.
+- **Verification is "lite"**: `anchor/verify` re-checks against a calendar + a block explorer (`BITCOIN_EXPLORER_URL`, Esplora shape). It does not re-verify the merkle path locally — the `otsProof` in the export remains independently verifiable with the `ots` CLI for anyone wanting the full cryptographic check.
+
+### Why OTS round-trips are not audited
+
+A single anchored proof generates ~1 submit + up to ~8 upgrade polls over a
+week. Writing each calendar round-trip to the audit chain would bloat the
+**global** `AuditLog` chain (every append serializes through one cursor —
+see Phase 6) for zero investigative value: the `ProofAnchor` row and its
+`status` transitions (STUB→PENDING→CONFIRMED/FAILED) are already the source
+of truth, observable directly. `lib/audit.ts` is untouched by Phase 7. Only
+the user-initiated `proof.anchor.verified` read is audited.
+
+### Backfill (`scripts/backfill-anchor-status.ts`)
+
+Gate for the `status` enum migration. Asserts (via raw SQL, pre-migration)
+that no existing `ProofAnchor.status` value falls outside the `AnchorStatus`
+enum, so the migration's `USING status::"AnchorStatus"` cast can't abort
+mid-run. A no-op in practice (Phase 5 only wrote `'STUB'`). Refuses prod
+without `--allow-prod`.
 
 ---
 
@@ -650,6 +726,18 @@ Explicitly **not** audited in Phase 6: chain-internal recomputes (the
 verifier doesn't audit per-row checks, only the verify call as a whole),
 backfill script execution (it's a one-shot ops tool — execution is logged
 to stdout, not the chain).
+
+**Phase 7 audited actions**:
+
+- `proof.anchor.verified` — **sensitive read** on GET /api/proofs/:id/anchor/verify; `entityType='Proof'`, `meta.status` (the `AnchorStatus`), `meta.confirmed` (whether a Bitcoin attestation was found, live).
+
+Explicitly **not** audited in Phase 7: OTS calendar submit/upgrade
+round-trips (high-volume — ~9 per anchored proof over a week; the
+`ProofAnchor` row's `status` transitions are the source of truth, and
+chain-writing them would bloat the global audit chain — see "Why OTS
+round-trips are not audited"). Job-internal `proof.anchor` /
+`proof.anchor.upgrade` lifecycle is observable through `ProofAnchor` +
+the existing `job.failed` audit on terminal failure.
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -806,5 +894,29 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       prod without `--allow-prod`). New audit actions:
       `audit.chain.verified`. New env var: `AUDIT_SIGNING_KEY` (64 hex,
       module-load fail-fast outside `NODE_ENV=test`).
-- [ ] Phase 7+ — Real OpenTimestamps integration replacing the Phase 5
-      anchor stub (calendar-server submission, async receipt, verify).
+- [x] **Phase 7 — Real OpenTimestamps anchoring**: replaced the Phase 5
+      anchor stub with a two-phase OTS flow. `proof.anchor`
+      (`lib/jobs/anchor.ts`) computes the proof content digest
+      (`lib/ots/proof-digest.ts` — chained audit entryHashes + file hashes
+      + attestation), submits it to the Bitcoin calendars in parallel with
+      bounded timeouts, writes `ProofAnchor` at `PENDING` with
+      `contentHash`, and enqueues `proof.anchor.upgrade`. The upgrade
+      handler (`lib/jobs/anchor-upgrade.ts`) polls on a backoff schedule
+      until a Bitcoin block attestation appears (→ `CONFIRMED` with
+      block height/hash) or the ~7-day cap is hit (→ `FAILED` via
+      `TerminalJobError`). All `opentimestamps` library use is isolated in
+      `lib/ots/client.ts` (+ `types/opentimestamps.d.ts` shim). New
+      endpoint `GET /api/proofs/[id]/anchor/verify` (audited
+      `proof.anchor.verified`) re-checks the anchor against a calendar +
+      block explorer without trusting the DB; `/export` gained anchor
+      fields + `verifyUrl`. Schema: `AnchorStatus` enum + `ProofAnchor`
+      `contentHash`/`bitcoinBlockHeight`/`bitcoinBlockHash`/`confirmedAt`/
+      `upgradedAt`. `lib/jobs.ts` gained `TerminalJobError`. New env vars:
+      `OTS_CALENDAR_URLS`, `BITCOIN_EXPLORER_URL`. Backfill:
+      `scripts/backfill-anchor-status.ts` (gates the enum migration).
+      `next.config.mjs` marks `opentimestamps` + `@node-rs/argon2` as
+      `serverComponentsExternalPackages` so the production build resolves
+      their native / broken-`main` packages.
+- [ ] Phase 8+ — Verification result enrichment: `/verify` returns real
+      `verified` / `tampered` / `not_found` results from hash comparison,
+      with a `cryptographically_verified` tier for CONFIRMED-anchored proofs.
