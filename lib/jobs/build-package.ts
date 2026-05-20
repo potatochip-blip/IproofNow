@@ -1,5 +1,6 @@
 import archiver from 'archiver';
-import { PassThrough } from 'node:stream';
+import { Transform } from 'node:stream';
+import { createHash, type Hash } from 'node:crypto';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../db';
 import { logger } from '../logger';
@@ -7,6 +8,30 @@ import { getObjectStream, getS3Client, getBucket } from '../storage';
 import { PutObjectCommand } from '@aws-sdk/client-s3';
 import { createNotification } from '../notifications';
 import type { JobHandler } from '../jobs';
+import {
+  signPackageDigest,
+  getPackagePublicKey,
+  type PackageSignatureFile,
+} from '../package-sig';
+
+/**
+ * A pass-through that sha256-hashes every byte flowing through it. Sits
+ * between the archiver and the S3 upload so the whole-zip digest is captured
+ * from exactly the bytes that get stored — no second read of the object.
+ */
+class HashingPassThrough extends Transform {
+  readonly hash: Hash = createHash('sha256');
+
+  override _transform(
+    chunk: Buffer,
+    _enc: BufferEncoding,
+    cb: (err?: Error | null) => void
+  ): void {
+    this.hash.update(chunk);
+    this.push(chunk);
+    cb();
+  }
+}
 
 type BuildPackagePayload = { packageId: string };
 
@@ -101,11 +126,41 @@ export const handleBuildPackage: JobHandler = async (payload, ctx) => {
 
   try {
     const storagePath = `packages/${pkg.id}.zip`;
-    await streamZipToS3(pkg, storagePath);
+    const contentHash = await streamZipToS3(pkg, storagePath);
+
+    // Phase 9: sign the whole-zip digest and upload a detached .sig sidecar
+    // BEFORE flipping the row to READY — a signing or sidecar-upload failure
+    // throws here, retries, and never leaves a READY-but-unsigned package.
+    const signedAt = new Date();
+    const { signature, signingKeyId } = signPackageDigest(contentHash);
+    const sigFile: PackageSignatureFile = {
+      packageId: pkg.id,
+      algorithm: 'ed25519',
+      signingKeyId,
+      contentHash: contentHash.toString('hex'),
+      signature,
+      signedAt: signedAt.toISOString(),
+      publicKey: getPackagePublicKey(),
+    };
+    await getS3Client().send(
+      new PutObjectCommand({
+        Bucket: getBucket(),
+        Key: `${storagePath}.sig`,
+        Body: JSON.stringify(sigFile, null, 2),
+        ContentType: 'application/json',
+      })
+    );
 
     await prisma.evidencePackage.update({
       where: { id: pkg.id },
-      data: { status: 'READY', storagePath },
+      data: {
+        status: 'READY',
+        storagePath,
+        contentHash,
+        signature,
+        signingKeyId,
+        signedAt,
+      },
     });
 
     await createNotification({
@@ -154,15 +209,16 @@ type LoadedPackage = Prisma.EvidencePackageGetPayload<{
 async function streamZipToS3(
   pkg: LoadedPackage,
   storagePath: string
-): Promise<void> {
+): Promise<Buffer> {
   if (!pkg.case) throw new Error('streamZipToS3: package has no case');
 
   const archive = archiver('zip', { zlib: { level: 6 } });
-  const passthrough = new PassThrough();
+  const hashing = new HashingPassThrough();
 
   // Wire the streams up before we start appending — otherwise the first
-  // entry races the consumer.
-  archive.pipe(passthrough);
+  // entry races the consumer. The hashing pass sits in the middle so the
+  // digest covers exactly the bytes S3 stores.
+  archive.pipe(hashing);
 
   // Capture upload promise without awaiting yet; we need to feed entries
   // first, then finalize, then await both.
@@ -170,7 +226,7 @@ async function streamZipToS3(
     new PutObjectCommand({
       Bucket: getBucket(),
       Key: storagePath,
-      Body: passthrough,
+      Body: hashing,
       ContentType: 'application/zip',
     })
   );
@@ -230,6 +286,9 @@ async function streamZipToS3(
   // rather than hang the upload promise.
   await Promise.race([archive.finalize(), archiveErrPromise]);
   await uploadPromise;
+
+  // Digest is final once every byte has passed through the hashing stream.
+  return hashing.hash.digest();
 }
 
 /** Strip path separators + control chars so an attacker-controlled
