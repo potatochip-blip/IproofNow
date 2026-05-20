@@ -15,6 +15,8 @@ import {
   type Role,
   type User,
   type VerificationRecord,
+  type VerificationResult,
+  type VerificationTier,
 } from '@prisma/client';
 import { buildStoredOtsProof } from './ots-stub';
 import { hashPassword } from '@/lib/password';
@@ -172,7 +174,11 @@ export async function createTestNotification(
 
 export async function createTestVerification(
   proofId: string,
-  overrides: Partial<{ method: string; result: string }> = {}
+  overrides: Partial<{
+    method: string;
+    result: VerificationResult;
+    tier: VerificationTier | null;
+  }> = {}
 ): Promise<VerificationRecord> {
   // Phase 6: route inserts through the per-proof chain helper so tests
   // exercise the same code path as production.
@@ -180,7 +186,8 @@ export async function createTestVerification(
   return appendVerificationRecord({
     proofId,
     method: overrides.method ?? 'hash',
-    result: overrides.result ?? 'verified',
+    result: overrides.result ?? 'VERIFIED',
+    tier: overrides.tier ?? null,
   });
 }
 

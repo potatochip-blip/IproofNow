@@ -72,6 +72,27 @@ enum AnchorStatus {
   FAILED
 }
 
+// Phase 8: outcome of a verification attempt (closed contract).
+//   VERIFIED      — recomputed content digest matches ProofAnchor.contentHash.
+//   TAMPERED      — recomputed digest does NOT match (proof changed post-anchor).
+//   NOT_FOUND     — no anchor / no contentHash baseline to compare against.
+//   INDETERMINATE — anchored, but the digest can't be computed right now
+//                   (a file hash is PENDING/FAILED) — retry.
+enum VerificationResult {
+  VERIFIED
+  TAMPERED
+  NOT_FOUND
+  INDETERMINATE
+}
+
+// Phase 8: strength tier for a VERIFIED result (null for other results).
+//   HASH_VERIFIED              — content matches the anchored digest.
+//   CRYPTOGRAPHICALLY_VERIFIED — and that anchor is Bitcoin-CONFIRMED.
+enum VerificationTier {
+  HASH_VERIFIED
+  CRYPTOGRAPHICALLY_VERIFIED
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────
 
 model User {
@@ -201,16 +222,21 @@ model ProofAttestation {
 // Phase 6: VerificationRecord rows form a per-proof hash chain.
 // prevHash/entryHash are populated by lib/verification-chain.ts inside a
 // SELECT … FOR UPDATE on VerificationChainCursor (keyed by proofId).
-// Backfill: scripts/backfill-audit-chain.ts also stamps existing rows.
+//
+// Phase 8: `result` became the VerificationResult enum and `tier` was
+// added; the entryHash composition now includes `tier`, so the chain
+// commits to it. That format change requires a one-time re-stamp —
+// scripts/backfill-verification-result.ts recomputes every entryHash.
 model VerificationRecord {
-  id               String   @id @default(cuid())
+  id               String             @id @default(cuid())
   proofId          String
   method           String
-  result           String
-  requesterContext Json     @default("{}")
+  result           VerificationResult
+  tier             VerificationTier?
+  requesterContext Json               @default("{}")
   prevHash         String?
   entryHash        String
-  createdAt        DateTime @default(now())
+  createdAt        DateTime           @default(now())
 
   proof Proof @relation(fields: [proofId], references: [id])
 

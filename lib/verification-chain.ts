@@ -1,11 +1,17 @@
 import { createHash } from 'node:crypto';
-import type { VerificationRecord } from '@prisma/client';
+import type {
+  VerificationRecord,
+  VerificationResult,
+  VerificationTier,
+} from '@prisma/client';
 import { prisma } from './db';
 
 export type AppendVerificationInput = {
   proofId: string;
   method: string;
-  result: string;
+  result: VerificationResult;
+  /** Strength tier — set only for a VERIFIED result, null otherwise. */
+  tier?: VerificationTier | null;
   requesterContext?: Record<string, unknown>;
 };
 
@@ -29,20 +35,25 @@ function canonicalJson(value: unknown): string {
 
 /**
  * Compute the entryHash for a VerificationRecord row. Exported so the
- * verifier and any backfill use the exact same composition rule as the
+ * verifier and the backfill use the exact same composition rule as the
  * writer.
  *
- * Composition: sha256(prevHash || proofId || method || result
- *                     || canonicalJson(requesterContext) || createdAt iso)
+ * Composition (Phase 8): sha256(prevHash || proofId || method || result
+ *   || tier || canonicalJson(requesterContext) || createdAt iso)
  *
  * Fields are NUL-delimited so distinct values can't collide via
- * concatenation. Null prevHash encodes as the empty string.
+ * concatenation. Null prevHash / null tier encode as the empty string.
+ *
+ * The `tier` slot is a Phase 8 addition — it changed the chain format, so
+ * every pre-Phase-8 row's entryHash is stale until re-stamped by
+ * scripts/backfill-verification-result.ts.
  */
 export function computeVerificationEntryHash(input: {
   prevHash: string | null;
   proofId: string;
   method: string;
   result: string;
+  tier: string | null;
   requesterContext: unknown;
   createdAt: Date;
 }): string {
@@ -52,6 +63,7 @@ export function computeVerificationEntryHash(input: {
     input.proofId,
     input.method,
     input.result,
+    input.tier ?? '',
     canonicalJson(input.requesterContext ?? {}),
     input.createdAt.toISOString(),
   ];
@@ -78,6 +90,7 @@ export async function appendVerificationRecord(
 ): Promise<VerificationRecord> {
   const createdAt = new Date();
   const requesterContext = input.requesterContext ?? {};
+  const tier = input.tier ?? null;
 
   return prisma.$transaction(async (tx) => {
     // Lazy-create the cursor row if this is the first verify for the proof.
@@ -103,6 +116,7 @@ export async function appendVerificationRecord(
       proofId: input.proofId,
       method: input.method,
       result: input.result,
+      tier,
       requesterContext,
       createdAt,
     });
@@ -112,6 +126,7 @@ export async function appendVerificationRecord(
         proofId: input.proofId,
         method: input.method,
         result: input.result,
+        tier,
         requesterContext: requesterContext as object,
         prevHash,
         entryHash,
@@ -183,6 +198,7 @@ export async function verifyVerificationChain(
       proofId: row.proofId,
       method: row.method,
       result: row.result,
+      tier: row.tier,
       requesterContext: row.requesterContext,
       createdAt: row.createdAt,
     });

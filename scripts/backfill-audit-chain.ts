@@ -181,6 +181,7 @@ async function backfillVerificationChains(prisma: PrismaClient): Promise<void> {
         proofId: row.proofId,
         method: row.method,
         result: row.result,
+        tier: row.tier,
         requesterContext: row.requesterContext,
         createdAt: row.createdAt,
       });
