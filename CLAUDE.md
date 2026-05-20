@@ -64,6 +64,7 @@ app/
     cases/[caseId]/proofs/[proofId]/route.ts    # DELETE unlink
     cases/[caseId]/packages/route.ts            # POST request (atomic with job enqueue) + GET list
     packages/[packageId]/route.ts               # detail (downloadUrl when READY)
+    packages/[packageId]/verify/route.ts        # verify package ed25519 signature (audited)
     proofs/[proofId]/export/route.ts            # JSON export (audited)
     proofs/[proofId]/anchor/verify/route.ts     # re-check OTS anchor (audited)
     audit/verify/route.ts                       # ADMIN-only chain integrity check
@@ -98,6 +99,7 @@ lib/
   audit-chain.ts             # verifyAuditChain — walks createdAt asc, recomputes + checks signatures
   verification-chain.ts      # appendVerificationRecord + verifyVerificationChain (per-proof chain)
   proof-verification.ts      # evaluateProof — real VERIFIED/TAMPERED/NOT_FOUND/INDETERMINATE + tier
+  package-sig.ts             # ed25519 detached package signing (sign + offline verifyPackageBytes)
   logger.ts                  # JSON line logger
 middleware.ts                # CORS for /api/* (allowlist + credentials)
 prisma/
@@ -109,7 +111,7 @@ tests/
   cookie-jar.ts              # in-memory jar that quacks like cookies()
   helpers.ts                 # truncateAll, createTestUser/Org/Proof/ProofFile/Anchor/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
   ots-stub.ts                # in-process stub OTS calendar + Bitcoin explorer for tests
-  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts anchor.test.ts anchor-upgrade.test.ts anchor-verify.test.ts verification-result.test.ts
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts anchor.test.ts anchor-upgrade.test.ts anchor-verify.test.ts verification-result.test.ts package-sig.test.ts package-verify.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
@@ -182,6 +184,15 @@ status='CONFIRMED').
 - The entryHash composition gained a `tier` slot, so every pre-Phase-8
   verification chain entryHash is stale until re-stamped by
   `scripts/backfill-verification-result.ts`.
+
+**Phase 9 schema additions** (`EvidencePackage` signing):
+- `contentHash Bytes?` — sha256 of the whole stored `.zip`.
+- `signature String?` — detached ed25519 signature (hex) over `contentHash`.
+- `signingKeyId String?` — fingerprint of the signing public key (lets a
+  key rotation leave older packages verifiable).
+- `signedAt DateTime?` — written atomically with the READY transition.
+- All nullable: legacy READY packages stay unsigned (`signed:false` at
+  verify time); no gate script needed — pure additive columns.
 
 Every FK is indexed. Common query columns indexed: `Proof.ownerUserId`,
 `Proof.orgId`, `(Proof.ownerUserId,status)`, `(Proof.orgId,status)`,
@@ -663,6 +674,60 @@ walks every proof's records and recomputes them (plus the per-proof
 
 ---
 
+## API contracts (Phase 9 — Evidence package signing)
+
+### Endpoint
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `GET` | `/api/packages/:packageId/verify` | required | Same access ladder as package detail (creator / case owner / same-org → else 404). Re-hashes the stored `.zip` and checks it against the signed digest + verifies the ed25519 signature. 200 → `{ signed, signatureValid, digestMatches, signingKeyId, signedAt, signatureUrl }`; legacy / non-READY / unsigned → `{ signed: false }`. Audits `package.verified`. |
+
+### Why ed25519, not HMAC
+
+A court bundle's value is that an **adversary** can verify it and **cannot
+forge** one. HMAC's verify key *is* its forge key — handing a court the
+verification key would let them mint fake "valid" packages. ed25519 is
+asymmetric: the **private** key signs (never leaves the signing service),
+the **public** key verifies (publish it freely). `lib/package-sig.ts` is
+the single ed25519 module — the Phase 6 audit chain stays HMAC because it
+is internal-only (no third-party verifier to disenfranchise).
+
+### Package digest + detached signature
+
+- **Digest = sha256 of the whole stored `.zip` object.** Deterministic for
+  a stored artifact, and verifiable with no unzip step and no zip-reader
+  dependency. Captured during the build via a hashing pass-through between
+  the archiver and the S3 upload.
+- The signature is **detached** — whole-zip hashing makes an in-zip
+  signature circular. It is stored on the `EvidencePackage` row **and** as
+  a sidecar S3 object `packages/{id}.zip.sig` (a self-describing JSON:
+  `{ packageId, algorithm:'ed25519', signingKeyId, contentHash, signature,
+  signedAt, publicKey }`).
+- **Build ordering**: sign + upload the `.sig` sidecar *before* the
+  `EvidencePackage` READY transition (all inside the existing retry
+  try/catch) — a signing failure retries and never leaves a
+  READY-but-unsigned package.
+- **`computeProofDigest` is not reused here** — that's the per-proof
+  content digest (Phase 7/8); a package digest covers the whole bundle.
+
+### Offline verification
+
+`scripts/verify-package.ts` is a standalone CLI: given a downloaded
+`.zip` + its `.zip.sig` (+ optionally iProofNow's published signing-key
+fingerprint), it re-hashes the zip and verifies the ed25519 signature with
+**no database, no network, no iProofNow server**. The shared core
+(`lib/package-sig.ts → verifyPackageBytes`) is pure — the verify route and
+the CLI both call it. The private key is loaded lazily so a verify-only
+consumer never needs `PACKAGE_SIGNING_PRIVATE_KEY`.
+
+### Backfill (`scripts/backfill-package-signatures.ts`)
+
+Optional one-shot — retro-signs READY packages built before Phase 9
+(download the existing zip, hash, sign, write the `.sig` + columns). It
+does not rebuild the zip. Refuses prod without `--allow-prod`.
+
+---
+
 ## Notification types
 
 Closed enum — frontend branches on `type` to pick icons and route targets,
@@ -817,6 +882,15 @@ now carries the real outcome in its meta: `meta.result` (the
 `VerificationResult`) and `meta.tier` (the `VerificationTier` or null).
 It fires for every verify, anonymous PUBLIC ones included, so a
 `TAMPERED` finding always lands in the audit chain.
+
+**Phase 9 audited actions**:
+
+- `package.verified` — **sensitive read** on GET /api/packages/:id/verify; `entityType='EvidencePackage'`, `meta.signed`, `meta.signatureValid`, `meta.digestMatches`.
+
+Explicitly **not** audited in Phase 9: package signing itself (it happens
+inside the `evidence_package.build` job — observable via the
+`EvidencePackage` signing columns + the `evidence_package_ready`
+notification).
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -1014,6 +1088,27 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       Schema: `VerificationResult` + `VerificationTier` enums,
       `VerificationRecord.result` → enum, `+ tier`. `proof.verified` audit
       meta gains `result` + `tier`.
-- [ ] Phase 9+ — Evidence package signing: detached signatures over
-      `EvidencePackage` zips so a court bundle is verifiable offline,
-      independent of iProofNow infrastructure.
+- [x] **Phase 9 — Evidence package signing**: every evidence package is
+      signed with a **detached ed25519 signature** so a court bundle is
+      verifiable offline by a third party who neither trusts nor can reach
+      iProofNow — and who cannot forge one (asymmetric: private key signs,
+      public key verifies). `lib/jobs/build-package.ts` captures the
+      whole-zip sha256 via a hashing pass-through, signs it with
+      `lib/package-sig.ts`, and uploads a self-describing `.sig` sidecar —
+      all before the READY transition, so a signing failure never leaves a
+      READY-but-unsigned package. New endpoint
+      `GET /api/packages/[id]/verify` (audited `package.verified`)
+      re-hashes the stored zip and checks the signature.
+      `scripts/verify-package.ts` is a standalone offline verifier (no DB,
+      no network). Schema: `EvidencePackage` `contentHash` / `signature` /
+      `signingKeyId` / `signedAt`. New env var: `PACKAGE_SIGNING_PRIVATE_KEY`.
+      Backfill: `scripts/backfill-package-signatures.ts` (retro-signs
+      legacy packages). The Phase 6 audit chain stays HMAC — it is
+      internal-only, no third party verifies it.
+
+**iProofNow backend is feature-complete (Phases 0–9).** Real
+OpenTimestamps anchoring, tamper-evident audit + verification chains,
+real verification results, and offline-verifiable signed evidence
+packages are all in place. C2PA provenance, perceptual hashing, OCR,
+Whisper transcription, billing, and email remain intentionally out of
+scope per the product brief.
