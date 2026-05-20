@@ -32,7 +32,7 @@ describe('verification record per-proof hash chain', () => {
       await appendVerificationRecord({
         proofId: proof.id,
         method: 'hash',
-        result: 'verified',
+        result: 'VERIFIED',
       });
     }
 
@@ -55,9 +55,9 @@ describe('verification record per-proof hash chain', () => {
     const proofA = await createTestProof(user.id, { title: 'A' });
     const proofB = await createTestProof(user.id, { title: 'B' });
 
-    await appendVerificationRecord({ proofId: proofA.id, method: 'hash', result: 'verified' });
-    await appendVerificationRecord({ proofId: proofB.id, method: 'hash', result: 'verified' });
-    await appendVerificationRecord({ proofId: proofA.id, method: 'qr', result: 'verified' });
+    await appendVerificationRecord({ proofId: proofA.id, method: 'hash', result: 'VERIFIED' });
+    await appendVerificationRecord({ proofId: proofB.id, method: 'hash', result: 'VERIFIED' });
+    await appendVerificationRecord({ proofId: proofA.id, method: 'qr', result: 'VERIFIED' });
 
     const aRows = await db().verificationRecord.findMany({
       where: { proofId: proofA.id },
@@ -83,8 +83,8 @@ describe('verification record per-proof hash chain', () => {
   it('detects tampered method as hash_mismatch', async () => {
     const { user } = await createTestUser();
     const proof = await createTestProof(user.id);
-    const r1 = await appendVerificationRecord({ proofId: proof.id, method: 'hash', result: 'verified' });
-    await appendVerificationRecord({ proofId: proof.id, method: 'qr', result: 'verified' });
+    const r1 = await appendVerificationRecord({ proofId: proof.id, method: 'hash', result: 'VERIFIED' });
+    await appendVerificationRecord({ proofId: proof.id, method: 'qr', result: 'VERIFIED' });
 
     await db().$executeRawUnsafe(
       `UPDATE "VerificationRecord" SET "method" = 'link' WHERE "id" = $1`,
@@ -102,14 +102,14 @@ describe('verification record per-proof hash chain', () => {
   it('per-proof cursor row mirrors the chain head', async () => {
     const { user } = await createTestUser();
     const proof = await createTestProof(user.id);
-    const r1 = await appendVerificationRecord({ proofId: proof.id, method: 'hash', result: 'verified' });
+    const r1 = await appendVerificationRecord({ proofId: proof.id, method: 'hash', result: 'VERIFIED' });
 
     const cursor1 = await db().verificationChainCursor.findUnique({
       where: { proofId: proof.id },
     });
     expect(cursor1?.lastEntryHash).toBe(r1.entryHash);
 
-    const r2 = await appendVerificationRecord({ proofId: proof.id, method: 'qr', result: 'verified' });
+    const r2 = await appendVerificationRecord({ proofId: proof.id, method: 'qr', result: 'VERIFIED' });
     const cursor2 = await db().verificationChainCursor.findUnique({
       where: { proofId: proof.id },
     });
@@ -122,7 +122,8 @@ describe('verification record per-proof hash chain', () => {
       prevHash: null,
       proofId: 'p1',
       method: 'hash',
-      result: 'verified',
+      result: 'VERIFIED',
+      tier: 'HASH_VERIFIED',
       requesterContext: { ip: '203.0.113.5' },
       createdAt: t,
     });
@@ -130,10 +131,58 @@ describe('verification record per-proof hash chain', () => {
       prevHash: null,
       proofId: 'p1',
       method: 'hash',
-      result: 'verified',
+      result: 'VERIFIED',
+      tier: 'HASH_VERIFIED',
       requesterContext: { ip: '203.0.113.5' },
       createdAt: t,
     });
     expect(a).toBe(b);
+  });
+
+  it('tier participates in the entryHash — differing tiers differ', () => {
+    const t = new Date('2026-05-20T12:00:00.000Z');
+    const base = {
+      prevHash: null,
+      proofId: 'p1',
+      method: 'hash',
+      result: 'VERIFIED' as const,
+      requesterContext: {},
+      createdAt: t,
+    };
+    const hash = computeVerificationEntryHash({ ...base, tier: 'HASH_VERIFIED' });
+    const crypto = computeVerificationEntryHash({
+      ...base,
+      tier: 'CRYPTOGRAPHICALLY_VERIFIED',
+    });
+    const none = computeVerificationEntryHash({ ...base, tier: null });
+    expect(hash).not.toBe(crypto);
+    expect(hash).not.toBe(none);
+  });
+
+  it('chain verifies with a tier folded into each record (Phase 8 format)', async () => {
+    const { user } = await createTestUser();
+    const proof = await createTestProof(user.id);
+
+    await appendVerificationRecord({
+      proofId: proof.id,
+      method: 'hash',
+      result: 'VERIFIED',
+      tier: 'CRYPTOGRAPHICALLY_VERIFIED',
+    });
+    await appendVerificationRecord({
+      proofId: proof.id,
+      method: 'qr',
+      result: 'TAMPERED',
+      tier: null,
+    });
+
+    const rows = await db().verificationRecord.findMany({
+      where: { proofId: proof.id },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(rows[0]?.tier).toBe('CRYPTOGRAPHICALLY_VERIFIED');
+    expect(rows[1]?.tier).toBeNull();
+
+    expect(await verifyVerificationChain(proof.id)).toEqual({ ok: true, count: 2 });
   });
 });

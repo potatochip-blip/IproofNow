@@ -46,7 +46,9 @@ describe('POST /api/proofs/[proofId]/verify', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.proofId).toBe(proof.id);
-    expect(body.result).toBe('verified');
+    // Unanchored proof → no baseline to compare against.
+    expect(body.result).toBe('NOT_FOUND');
+    expect(body.tier).toBeNull();
     expect(body.verificationId).toBeTruthy();
 
     const rec = await db().verificationRecord.findUnique({
@@ -124,9 +126,15 @@ describe('GET /api/proofs/[proofId]/verifications', () => {
     await loginAs(user.id);
     const proof = await createTestProof(user.id);
 
-    await createTestVerification(proof.id, { result: 'verified' });
-    await createTestVerification(proof.id, { result: 'verified' });
-    await createTestVerification(proof.id, { result: 'not_found' });
+    await createTestVerification(proof.id, {
+      result: 'VERIFIED',
+      tier: 'CRYPTOGRAPHICALLY_VERIFIED',
+    });
+    await createTestVerification(proof.id, {
+      result: 'VERIFIED',
+      tier: 'HASH_VERIFIED',
+    });
+    await createTestVerification(proof.id, { result: 'NOT_FOUND' });
 
     const res = await listVerifications(
       new Request(`http://localhost/api/proofs/${proof.id}/verifications`) as NextRequest,
@@ -135,7 +143,13 @@ describe('GET /api/proofs/[proofId]/verifications', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.verifications).toHaveLength(3);
-    expect(body.counts).toEqual({ verified: 2, notFound: 1, tampered: 0 });
+    expect(body.counts).toEqual({
+      verified: 2,
+      tampered: 0,
+      notFound: 1,
+      indeterminate: 0,
+    });
+    expect(body.tiers).toEqual({ hashVerified: 1, cryptographicallyVerified: 1 });
     expect(body.pagination.total).toBe(3);
   });
 
