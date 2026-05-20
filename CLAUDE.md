@@ -97,10 +97,11 @@ lib/
   audit-sig.ts               # KMS-style HMAC-SHA-256 over entryHash; fail-fast on missing AUDIT_SIGNING_KEY
   audit-chain.ts             # verifyAuditChain — walks createdAt asc, recomputes + checks signatures
   verification-chain.ts      # appendVerificationRecord + verifyVerificationChain (per-proof chain)
+  proof-verification.ts      # evaluateProof — real VERIFIED/TAMPERED/NOT_FOUND/INDETERMINATE + tier
   logger.ts                  # JSON line logger
 middleware.ts                # CORS for /api/* (allowlist + credentials)
 prisma/
-  schema.prisma              # 17 models + 8 enums
+  schema.prisma              # 17 models + 10 enums
   seed.ts                    # 6 users (one per role); refuses to run in production
 tests/
   global-setup.ts            # prisma db push --force-reset against *_test DB
@@ -108,7 +109,7 @@ tests/
   cookie-jar.ts              # in-memory jar that quacks like cookies()
   helpers.ts                 # truncateAll, createTestUser/Org/Proof/ProofFile/Anchor/Case/Package/Notification/Verification, loginAs, joinOrg, linkCaseProof, buildJsonRequest, buildMultipartRequest
   ots-stub.ts                # in-process stub OTS calendar + Bitcoin explorer for tests
-  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts anchor.test.ts anchor-upgrade.test.ts anchor-verify.test.ts
+  auth.test.ts dashboard.test.ts proofs.test.ts vault.test.ts vault-reveal.test.ts verify.test.ts notifications.test.ts audit-query.test.ts cases.test.ts case-proofs.test.ts case-packages.test.ts jobs.test.ts hash-file.test.ts build-package.test.ts export.test.ts rate-limit.test.ts audit-chain.test.ts audit-sig.test.ts verification-chain.test.ts audit-immutable-reveal.test.ts anchor.test.ts anchor-upgrade.test.ts anchor-verify.test.ts verification-result.test.ts
 docker-compose.yml           # postgres:16-alpine + minio + minio-init bucket creator
 .env.example                 # all required env vars; DATABASE_URL_TEST must end in _test
 ```
@@ -127,7 +128,9 @@ Enums: `Role` (INDIVIDUAL|COMPANY|LAWYER|LAW_ENFORCEMENT|GOVERNMENT|ADMIN),
 `PackageStatus` (PENDING|READY|FAILED), `SubscriptionTier`
 (FREE|PRO|BUSINESS|ENTERPRISE), `HashStatus` (PENDING|COMPLETE|FAILED),
 `JobStatus` (PENDING|RUNNING|COMPLETE|FAILED),
-`AnchorStatus` (STUB|PENDING|CONFIRMED|FAILED).
+`AnchorStatus` (STUB|PENDING|CONFIRMED|FAILED),
+`VerificationResult` (VERIFIED|TAMPERED|NOT_FOUND|INDETERMINATE),
+`VerificationTier` (HASH_VERIFIED|CRYPTOGRAPHICALLY_VERIFIED).
 
 **Phase 2 schema additions**: `Proof.roleContext String?` (freeform role
 context on draft creation); `ProofFile.hashStatus HashStatus @default(PENDING)`
@@ -169,6 +172,16 @@ status='CONFIRMED').
 - `bitcoinBlockHeight Int?`, `bitcoinBlockHash String?`, `confirmedAt
   DateTime?`, `upgradedAt DateTime?` — populated on the CONFIRMED transition
   from the Bitcoin attestation + block explorer.
+
+**Phase 8 schema additions** (`VerificationRecord` evolution):
+- `result` is now the `VerificationResult` enum (was a free `String` that
+  Phase 3–7 always wrote as `'verified'`). Migration converts via
+  `USING upper(result)::"VerificationResult"`.
+- `tier VerificationTier?` — strength tier, set only for a `VERIFIED`
+  result, null otherwise.
+- The entryHash composition gained a `tier` slot, so every pre-Phase-8
+  verification chain entryHash is stale until re-stamped by
+  `scripts/backfill-verification-result.ts`.
 
 Every FK is indexed. Common query columns indexed: `Proof.ownerUserId`,
 `Proof.orgId`, `(Proof.ownerUserId,status)`, `(Proof.orgId,status)`,
@@ -590,6 +603,66 @@ without `--allow-prod`.
 
 ---
 
+## API contracts (Phase 8 — Verification result enrichment)
+
+### Endpoints
+
+| Method | Path | Auth | Notes |
+| --- | --- | --- | --- |
+| `POST` | `/api/proofs/:proofId/verify` | conditional | Result is now **real** (was always `'verified'`). Response: `{ verificationId, proofId, result, tier, verifiedAt }`. `result ∈ VERIFIED\|TAMPERED\|NOT_FOUND\|INDETERMINATE`; `tier ∈ HASH_VERIFIED\|CRYPTOGRAPHICALLY_VERIFIED\|null`. Audits `proof.verified` (meta gains `result` + `tier`). |
+| `GET` | `/api/proofs/:proofId/verifications` | conditional | `counts` now covers all four results (`{ verified, tampered, notFound, indeterminate }`); new `tiers: { hashVerified, cryptographicallyVerified }`. Each row carries `tier`. |
+
+### Result & tier taxonomy (closed contract)
+
+`evaluateProof` (`lib/proof-verification.ts`) recomputes the proof's content
+digest and compares it to `ProofAnchor.contentHash`:
+
+- **`VERIFIED`** — recomputed digest matches. Tier is
+  `CRYPTOGRAPHICALLY_VERIFIED` when the anchor is Bitcoin-`CONFIRMED`, else
+  `HASH_VERIFIED` (PENDING/FAILED anchor — content matches but not yet, or
+  never, on Bitcoin).
+- **`TAMPERED`** — recomputed digest ≠ `contentHash`. The proof's content
+  changed after anchoring. `tier = null`.
+- **`NOT_FOUND`** — no `ProofAnchor`, or the anchor has no `contentHash`
+  baseline (DRAFT / unanchored-sealed / legacy STUB). `tier = null`.
+- **`INDETERMINATE`** — an anchor exists but the digest can't be computed
+  right now (a `ProofFile` hash is PENDING or FAILED). Transient for a
+  normally-anchored proof — caller should retry. `tier = null`.
+
+Adding a result or tier value is a deliberate contract change. `proof.verified`
+is audited for **every** verify, anonymous PUBLIC ones included — so a
+`TAMPERED` finding is never silent.
+
+### Content digest must be time-stable (Phase 8 fix)
+
+`computeProofDigest` previously folded in *every* `AuditLog` row tagged
+`entityType='Proof'`. But `proof.verified` / `proof.exported` /
+`proof.anchor.verified` rows match that filter too, and every verify
+**appends** a `proof.verified` row — so an unfiltered digest drifts on each
+verification and a re-check would false-positive `TAMPERED`. Phase 8
+restricts the digest to a **closed set of content-establishing actions**
+(`proof.created`, `proof.updated`, `proof.file.uploaded`,
+`proof.attestation.saved`, `proof.sealed`) — all frozen once a proof is
+SEALED. The digest of a sealed proof is therefore permanently stable, which
+is what makes recompute-and-compare sound. `computeProofDigestCached` memoizes
+it keyed by `(proofId, Proof.updatedAt)` (a sealed proof can't be PATCHed, so
+the entry is effectively permanent; any change bumps `updatedAt` and
+invalidates it). **Clean cutover**: this changes the digest definition, but
+the project has no remote/deployment/production data, so no `digestVersion`
+compatibility shim — any proof anchored before this fix should be re-anchored.
+
+### Verification chain format change
+
+The per-proof verification chain's `entryHash` composition gained a `tier`
+slot: `sha256(prevHash || proofId || method || result || tier ||
+canonical(requesterContext) || createdAt)`. Every pre-Phase-8 row's
+`entryHash` is stale until re-stamped — `scripts/backfill-verification-result.ts`
+walks every proof's records and recomputes them (plus the per-proof
+`VerificationChainCursor` head). Run it once after the migration;
+`verifyVerificationChain` reports rows broken until it does.
+
+---
+
 ## Notification types
 
 Closed enum — frontend branches on `type` to pick icons and route targets,
@@ -738,6 +811,12 @@ chain-writing them would bloat the global audit chain — see "Why OTS
 round-trips are not audited"). Job-internal `proof.anchor` /
 `proof.anchor.upgrade` lifecycle is observable through `ProofAnchor` +
 the existing `job.failed` audit on terminal failure.
+
+**Phase 8 audited actions**: no new action — `proof.verified` (Phase 3)
+now carries the real outcome in its meta: `meta.result` (the
+`VerificationResult`) and `meta.tier` (the `VerificationTier` or null).
+It fires for every verify, anonymous PUBLIC ones included, so a
+`TAMPERED` finding always lands in the audit chain.
 
 **Rule for later phases**: audit **state changes** and **sensitive reads**.
 Skip routine reads.
@@ -917,6 +996,24 @@ The user's frontend zip is extracted at `C:\IproofNow-frontend\`
       `next.config.mjs` marks `opentimestamps` + `@node-rs/argon2` as
       `serverComponentsExternalPackages` so the production build resolves
       their native / broken-`main` packages.
-- [ ] Phase 8+ — Verification result enrichment: `/verify` returns real
-      `verified` / `tampered` / `not_found` results from hash comparison,
-      with a `cryptographically_verified` tier for CONFIRMED-anchored proofs.
+- [x] **Phase 8 — Verification result enrichment**: `POST /verify` returns
+      a real result instead of the Phase 3 always-`'verified'` placeholder.
+      `lib/proof-verification.ts → evaluateProof` recomputes the proof
+      content digest and compares it to `ProofAnchor.contentHash`, yielding
+      `VERIFIED` / `TAMPERED` / `NOT_FOUND` / `INDETERMINATE` (closed
+      `VerificationResult` enum) plus a `VerificationTier`
+      (`HASH_VERIFIED`, or `CRYPTOGRAPHICALLY_VERIFIED` for a
+      Bitcoin-`CONFIRMED` anchor). Required correctness fix:
+      `computeProofDigest` now filters `AuditLog` to content-establishing
+      actions so the digest is time-stable (an unfiltered digest drifted
+      every verify and would false-positive `TAMPERED`); a
+      `(proofId,updatedAt)` memo cache backs the per-verify recompute.
+      The verification-chain `entryHash` composition gained a `tier` slot;
+      `scripts/backfill-verification-result.ts` re-stamps existing chains.
+      `GET /verifications` reports enum counts + a `tiers` breakdown.
+      Schema: `VerificationResult` + `VerificationTier` enums,
+      `VerificationRecord.result` → enum, `+ tier`. `proof.verified` audit
+      meta gains `result` + `tier`.
+- [ ] Phase 9+ — Evidence package signing: detached signatures over
+      `EvidencePackage` zips so a court bundle is verifiable offline,
+      independent of iProofNow infrastructure.
