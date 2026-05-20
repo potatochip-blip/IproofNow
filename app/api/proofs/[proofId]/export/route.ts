@@ -50,7 +50,20 @@ export async function GET(_req: NextRequest, ctx: RouteCtx) {
         ? {
             status: anchor.status,
             anchoredAt: anchor.anchoredAt.toISOString(),
-            otsProof: anchor.otsProof.toString('base64'),
+            confirmedAt: anchor.confirmedAt?.toISOString() ?? null,
+            // contentHash is the digest we submitted to OpenTimestamps —
+            // recompute lib/ots/proof-digest to detect tampering.
+            contentHash: anchor.contentHash
+              ? Buffer.from(anchor.contentHash).toString('hex')
+              : null,
+            // The OTS receipt: PENDING → partial proof; CONFIRMED → full
+            // receipt independently verifiable with the `ots` CLI.
+            otsProof: Buffer.from(anchor.otsProof).toString('base64'),
+            bitcoinBlockHeight: anchor.bitcoinBlockHeight,
+            bitcoinBlockHash: anchor.bitcoinBlockHash,
+            // Re-check the anchor against the calendars / block explorer
+            // without trusting this payload.
+            verifyUrl: `/api/proofs/${proof.id}/anchor/verify`,
           }
         : null,
     });
