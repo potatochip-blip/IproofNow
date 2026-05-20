@@ -19,6 +19,12 @@ export default defineConfig({
   resolve: {
     alias: {
       '@': resolve(__dirname, '.'),
+      // The `opentimestamps` package ships a broken `main` field
+      // ('open-timestamps.js' — a path that doesn't exist). Node's resolver
+      // silently falls back to index.js; Vite/Rollup does not. Point the
+      // bare specifier straight at the real CJS entry. next.config.mjs
+      // applies the same alias for the production build.
+      opentimestamps: resolve(__dirname, 'node_modules/opentimestamps/index.js'),
     },
   },
 });
