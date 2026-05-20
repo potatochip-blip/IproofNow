@@ -295,6 +295,15 @@ model CaseProof {
   @@index([proofId])
 }
 
+// Phase 9: a READY package is signed with a detached ed25519 signature.
+//   contentHash  — sha256 of the whole stored .zip object.
+//   signature    — ed25519 signature (hex) over contentHash.
+//   signingKeyId — fingerprint of the public key used, so a key rotation
+//                  leaves older packages independently verifiable.
+//   signedAt     — wall-clock of the signing.
+// All nullable: legacy READY packages built before Phase 9 stay unsigned
+// (the verify endpoint reports them `signed:false`); the signing columns
+// are written atomically with the READY transition for new builds.
 model EvidencePackage {
   id              String        @id @default(cuid())
   caseId          String?
@@ -303,6 +312,10 @@ model EvidencePackage {
   packageType     String
   createdByUserId String
   storagePath     String?
+  contentHash     Bytes?
+  signature       String?
+  signingKeyId    String?
+  signedAt        DateTime?
   createdAt       DateTime      @default(now())
 
   case      Case?  @relation(fields: [caseId], references: [id])
