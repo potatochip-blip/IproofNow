@@ -58,6 +58,20 @@ enum JobStatus {
   FAILED
 }
 
+// Phase 7: ProofAnchor lifecycle.
+//   STUB      — pre-Phase-7 placeholder (deterministic sha256(proofId)).
+//   PENDING   — digest submitted to OTS calendars; partial proof stored,
+//               awaiting a Bitcoin-confirmed receipt.
+//   CONFIRMED — calendar returned a Bitcoin block attestation; otsProof
+//               holds the full receipt.
+//   FAILED    — upgrade never confirmed within the 7-day cap.
+enum AnchorStatus {
+  STUB
+  PENDING
+  CONFIRMED
+  FAILED
+}
+
 // ─── Models ───────────────────────────────────────────────────────────────
 
 model User {
@@ -364,15 +378,32 @@ model Job {
   @@index([status, runAfter])
 }
 
-// Phase 5 stores stub anchors (status='STUB') with a deterministic
-// pseudo-otsProof. Phase 7's OpenTimestamps integration will overwrite
-// otsProof with a real OTS receipt and flip status='CONFIRMED'.
+// Phase 7: OpenTimestamps anchor.
+//   contentHash        — the 32-byte sha256 digest actually submitted to the
+//                        calendars (chained AuditLog entries + ProofFile
+//                        hashes + ProofAttestation; see lib/ots/proof-digest).
+//                        Stored so anchor/verify and the Phase 8 tamper check
+//                        don't have to deserialize otsProof. Nullable only
+//                        for legacy STUB rows.
+//   otsProof           — PENDING: partial proof from POST /digest.
+//                        CONFIRMED: full receipt from GET /timestamp/<c>.
+//   bitcoinBlockHeight — populated on CONFIRMED from the Bitcoin attestation.
+//   bitcoinBlockHash   — populated on CONFIRMED.
+//   confirmedAt        — wall-clock of the CONFIRMED transition.
+//   upgradedAt         — wall-clock the partial proof was replaced by the
+//                        confirmed receipt (== confirmedAt today; separate
+//                        column so a future "re-upgrade" path stays clean).
 model ProofAnchor {
-  id         String   @id @default(cuid())
-  proofId    String   @unique
-  otsProof   Bytes
-  status     String   @default("STUB")
-  anchoredAt DateTime @default(now())
+  id                 String       @id @default(cuid())
+  proofId            String       @unique
+  contentHash        Bytes?
+  otsProof           Bytes
+  status             AnchorStatus @default(STUB)
+  bitcoinBlockHeight Int?
+  bitcoinBlockHash   String?
+  anchoredAt         DateTime     @default(now())
+  confirmedAt        DateTime?
+  upgradedAt         DateTime?
 
   proof Proof @relation(fields: [proofId], references: [id], onDelete: Cascade)
 }
