@@ -2,8 +2,10 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import type { NextRequest } from 'next/server';
 import { POST as uploadFile } from '@/app/api/proofs/[proofId]/files/route';
 import { POST as requestPackage } from '@/app/api/cases/[caseId]/packages/route';
+import { GET as verifyPackage } from '@/app/api/packages/[packageId]/verify/route';
 import { drainJobs } from '@/lib/jobs';
-import { isStorageReachable, getPresignedGetUrl } from '@/lib/storage';
+import { isStorageReachable, getPresignedGetUrl, putObject } from '@/lib/storage';
+import { verifyPackageBytes } from '@/lib/package-sig';
 import {
   buildJsonRequest,
   buildMultipartRequest,
@@ -98,6 +100,40 @@ describe('evidence_package.build worker (MinIO-gated)', () => {
     expect(buf.length).toBeGreaterThan(50);
     // Zip files start with the local file header signature 'PK\x03\x04'.
     expect(buf.slice(0, 4).toString('hex')).toBe('504b0304');
+
+    // Phase 9: the built package is signed.
+    expect(pkg?.signature).toBeTruthy();
+    expect(pkg?.contentHash).toBeTruthy();
+    expect(pkg?.signingKeyId).toMatch(/^[0-9a-f]{16}$/);
+    expect(pkg?.signedAt).toBeTruthy();
+
+    // The detached .sig sidecar lets an offline verifier accept the bundle.
+    const sigRes = await fetch(await getPresignedGetUrl(`${pkg!.storagePath}.sig`));
+    expect(sigRes.status).toBe(200);
+    const sig = await sigRes.json();
+    expect(verifyPackageBytes(buf, sig).ok).toBe(true);
+
+    // The verify endpoint agrees.
+    const okRes = await verifyPackage(
+      new Request(`http://localhost/api/packages/${packageId}/verify`) as NextRequest,
+      { params: { packageId } }
+    );
+    expect(await okRes.json()).toMatchObject({
+      signed: true,
+      signatureValid: true,
+      digestMatches: true,
+    });
+
+    // Tamper the stored zip — digestMatches must flip to false.
+    await putObject(pkg!.storagePath!, Buffer.from('not a zip anymore'), 'application/zip');
+    const tamperedRes = await verifyPackage(
+      new Request(`http://localhost/api/packages/${packageId}/verify`) as NextRequest,
+      { params: { packageId } }
+    );
+    const tampered = await tamperedRes.json();
+    expect(tampered.signed).toBe(true);
+    expect(tampered.signatureValid).toBe(true);
+    expect(tampered.digestMatches).toBe(false);
   });
 
   it('owner-self request still notifies owner (mirrors proof_sealed self-notify)', async (t) => {
